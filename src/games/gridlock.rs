@@ -240,8 +240,8 @@ impl S {
             for x in 0..W {
                 let cell = self.grid[idx(x, y)];
                 let c = match cell {
-                    0 if x % 4 == 0 && y % 4 == 0 => Rgb::hex(0x121A5C),
-                    0 => Rgb::hex(0x070A2C),
+                    0 if x % 4 == 0 && y % 4 == 0 => Rgb::hex(0x24221B),
+                    0 => Rgb::hex(0x141310),
                     WALL => if (x + y) % 4 < 2 { pal::PODIUM } else { pal::PODIUM_DARK },
                     owner => {
                         let p = owner - 1;

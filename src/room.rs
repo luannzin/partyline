@@ -1,254 +1,107 @@
-//! The living room. A night scene drawn analytically in world space (160 x 90 "pixels"),
-//! seen through a camera so the menu can dolly straight into the TV screen.
+//! The living room, pre-rendered in Blender (`tools/scene.py`): a dolly from behind the couch
+//! straight into the CRT. Two light passes (bare bulb, TV) are mixed live, so the TV glow follows
+//! the highlighted menu item and the bulb buzzes; the game draws the TV glass where the mask says.
 use ratatui::layout::Rect;
 
+use crate::art;
 use crate::gfx::{Canvas, Rgb, hash, pal};
 
-pub const WW: f32 = 160.0;
-pub const WH: f32 = 90.0;
-/// TV screen in world space: x, y, w, h.
-pub const SCREEN: (f32, f32, f32, f32) = (44.0, 11.0, 72.0, 42.0);
-
-#[derive(Clone, Copy)]
-pub struct Cam {
-    pub cx: f32,
-    pub cy: f32,
-    pub zoom: f32,
+pub struct Shot {
+    pub cv: Canvas,
+    /// TV glass bounds in canvas pixels: x0, y0, x1, y1 (inclusive). Empty when out of view.
+    glass: (i32, i32, i32, i32),
 }
 
-impl Cam {
-    pub fn room() -> Cam {
-        Cam { cx: WW / 2.0, cy: WH / 2.0, zoom: 1.0 }
-    }
-    /// Camera that fills the terminal with the TV screen (cropping whichever side overflows).
-    pub fn tv(area: Rect) -> Cam {
-        let (w, h) = (area.width as f32, area.height as f32 * 2.0);
-        let s0 = base_scale(area);
-        let zoom = (w / (SCREEN.2 * s0)).max(h / (SCREEN.3 * s0)) * 1.02;
-        Cam { cx: SCREEN.0 + SCREEN.2 / 2.0, cy: SCREEN.1 + SCREEN.3 / 2.0, zoom }
-    }
-    pub fn lerp(a: Cam, b: Cam, t: f32) -> Cam {
-        Cam {
-            cx: a.cx + (b.cx - a.cx) * t,
-            cy: a.cy + (b.cy - a.cy) * t,
-            zoom: (a.zoom.ln() + (b.zoom.ln() - a.zoom.ln()) * t).exp(),
+impl Shot {
+    /// The TV glass in terminal cells, rounded inward.
+    pub fn screen(&self, area: Rect) -> Rect {
+        let (x0, y0, x1, y1) = self.glass;
+        let (r0, r1) = ((y0 + 1) / 2, (y1 + 1) / 2);
+        if x1 <= x0 || r1 <= r0 {
+            return Rect::new(area.x, area.y, 0, 0);
         }
+        Rect::new(area.x + x0 as u16, area.y + r0 as u16, (x1 - x0 + 1) as u16, (r1 - r0) as u16)
     }
 }
 
-fn base_scale(area: Rect) -> f32 {
-    (area.width as f32 / WW).min(area.height as f32 * 2.0 / WH)
-}
-
-/// Where the TV screen lands in terminal cells for this camera.
-pub fn screen_rect(area: Rect, cam: Cam) -> Rect {
-    let s = base_scale(area) * cam.zoom;
-    let (w, h) = (area.width as f32, area.height as f32 * 2.0);
-    let x0 = ((SCREEN.0 - cam.cx) * s + w / 2.0).ceil().max(0.0);
-    let x1 = ((SCREEN.0 + SCREEN.2 - cam.cx) * s + w / 2.0).floor().min(w);
-    let y0 = (((SCREEN.1 - cam.cy) * s + h / 2.0) / 2.0).ceil().max(0.0);
-    let y1 = (((SCREEN.1 + SCREEN.3 - cam.cy) * s + h / 2.0) / 2.0).floor().min(area.height as f32);
-    Rect::new(area.x + x0 as u16, area.y + y0 as u16, (x1 - x0).max(0.0) as u16, (y1 - y0).max(0.0) as u16)
-}
-
-/// Paint the room onto a canvas (caller blits). `glow` is the color the TV throws into the room.
-pub fn draw(area: Rect, cam: Cam, t: f32, glow: Rgb) -> Canvas {
+/// `p`: 0 = the room shot from behind the couch, 1 = the glass fills the view.
+pub fn draw(area: Rect, p: f32, t: f32, glow: Rgb) -> Shot {
+    let art = art::get();
     let mut cv = Canvas::for_area(area, pal::BLACK);
-    let s = base_scale(area) * cam.zoom;
+    let f = p.clamp(0.0, 1.0) * (art.frames - 1) as f32;
+    let i0 = f.floor() as usize;
+    let (i1, mix) = ((i0 + 1).min(art.frames - 1), f.fract());
+    let (iw, ih) = (art.room_a.w as f32, art.frame_h as f32);
+    let s = (cv.w as f32 / iw).max(cv.h as f32 / ih);
+    let (ox, oy) = ((iw - cv.w as f32 / s) / 2.0, (ih - cv.h as f32 / s) / 2.0);
+
+    // Bare bulb: a steady buzz and the odd brownout. The TV breathes a little.
+    let brownout = if hash((t * 9.0) as u32, 3) % 61 == 0 { 0.5 } else { 1.0 };
+    let bulb = 1.4 * brownout * (1.0 + 0.05 * (t * 13.0).sin() * (t * 5.3).sin());
+    let tv = 1.5 * (1.0 + 0.04 * (t * 21.0).sin());
+    let glass_base = pal::BLACK.lerp(glow, 0.3 * (1.0 - p * 0.85));
+    let frame = (t * 30.0) as u32;
+
+    let sample = |img: &art::Img, u: f32, v: f32| {
+        let at = |i: usize| {
+            let y0 = (i * art.frame_h) as f32 + v;
+            img.area(u, y0, u + 1.0 / s, (y0 + 1.0 / s).min(((i + 1) * art.frame_h) as f32))
+        };
+        let a = at(i0);
+        if mix < 0.01 {
+            return a;
+        }
+        let b = at(i1);
+        [0, 1, 2, 3].map(|k| a[k] + (b[k] - a[k]) * mix)
+    };
+
+    let mut bb = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
     let (w, h) = (cv.w as f32, cv.h as f32);
-    cv.fill(|px, py| {
-        let wx = (px as f32 + 0.5 - w / 2.0) / s + cam.cx;
-        let wy = (py as f32 + 0.5 - h / 2.0) / s + cam.cy;
-        let c = scene(wx, wy, t, glow);
-        // Cinematic vignette in screen space.
-        let (vx, vy) = (px as f32 / w - 0.5, py as f32 / h - 0.5);
-        c.mul(1.0 - (vx * vx + vy * vy) * 0.9)
-    });
-    cv
-}
-
-fn rrect(x: f32, y: f32, x0: f32, y0: f32, w: f32, h: f32, r: f32) -> bool {
-    let (cx, cy) = ((x - x0 - w / 2.0).abs() - (w / 2.0 - r), (y - y0 - h / 2.0).abs() - (h / 2.0 - r));
-    let (ox, oy) = (cx.max(0.0), cy.max(0.0));
-    (ox * ox + oy * oy).sqrt() + cx.max(cy).min(0.0) <= r
-}
-
-fn seg_dist(x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    let (dx, dy) = (bx - ax, by - ay);
-    let k = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
-    ((x - ax - dx * k).powi(2) + (y - ay - dy * k).powi(2)).sqrt()
-}
-
-/// Light thrown by the TV and the lamp onto room surfaces.
-fn lit(c: Rgb, x: f32, y: f32, glow: Rgb, t: f32) -> Rgb {
-    let (sx, sy) = (SCREEN.0 + SCREEN.2 / 2.0, SCREEN.1 + SCREEN.3 / 2.0);
-    let d2 = (x - sx).powi(2) + ((y - sy) * 1.3).powi(2);
-    let flicker = 1.0 + 0.04 * (t * 7.3).sin() * (t * 3.1).sin();
-    let tv = glow.mul(0.85 * flicker / (1.0 + d2 / 900.0));
-    let ld2 = (x - 156.0).powi(2) + (y - 22.0).powi(2);
-    let lamp = pal::LAMP.mul(0.32 / (1.0 + ld2 / 260.0));
-    Rgb(c.0 * (1.0 + tv.0 * 2.2) + tv.0 * 0.12 + lamp.0 * 0.5, c.1 * (1.0 + tv.1 * 2.2) + tv.1 * 0.12 + lamp.1 * 0.5, c.2 * (1.0 + tv.2 * 2.2) + tv.2 * 0.12 + lamp.2 * 0.5)
-}
-
-fn scene(x: f32, y: f32, t: f32, glow: Rgb) -> Rgb {
-    // Couch and the two friends sitting on it (foreground, nearest first).
-    let couch_top = 73.0 + ((x - 80.0) / 66.0).powi(2) * 2.0;
-    let in_arm = rrect(x, y, 6.0, 76.0, 16.0, 20.0, 3.0) || rrect(x, y, 138.0, 76.0, 16.0, 20.0, 3.0);
-    if in_arm || (x > 14.0 && x < 146.0 && y >= couch_top) {
-        let mut c = pal::COUCH;
-        if !in_arm && ((x - 58.0).abs() < 0.5 || (x - 102.0).abs() < 0.5) {
-            c = c.mul(0.7);
-        }
-        let edge = if in_arm { (y - 76.0).abs() < 1.2 } else { y - couch_top < 1.3 };
-        if edge {
-            c = c.add(glow.mul(0.35));
-        }
-        return c.mul(0.9);
-    }
-    for (hx, hy, r) in [(62.0f32, 71.0f32, 6.5f32), (100.0, 72.0, 6.0)] {
-        let d = ((x - hx).powi(2) + (y - hy).powi(2)).sqrt();
-        if d <= r {
-            let rim = d > r - 1.1 && y < hy - r * 0.2;
-            return if rim { Rgb::hex(0x120E1A).add(glow.mul(0.55)) } else { Rgb::hex(0x0E0B15) };
-        }
-    }
-
-    // The TV.
-    let (sx, sy, sw, sh) = SCREEN;
-    if rrect(x, y, sx, sy, sw, sh, 3.0) {
-        let (nx, ny) = ((x - sx) / sw - 0.5, (y - sy) / sh - 0.5);
-        let vig = 1.0 - (nx * nx + ny * ny) * 1.1;
-        let sheen = if nx + ny < -0.55 && nx + ny > -0.62 { 0.06 } else { 0.0 };
-        let base = pal::STAGE_DEEP.lerp(glow, 0.45);
-        return base.mul(vig).add(Rgb(sheen, sheen, sheen));
-    }
-    if rrect(x, y, 36.0, 6.0, 88.0, 55.0, 5.0) {
-        let mut c = pal::TV_BODY.mul(1.0 - (x - 36.0) / 88.0 * 0.25);
-        if rrect(x, y, 41.0, 9.0, 78.0, 46.5, 4.0) {
-            c = Rgb::hex(0x16151B);
-        } else if y < 7.2 {
-            c = c.mul(1.5);
-        }
-        if y > 55.0 && y < 59.5 && x > 48.0 && x < 104.0 && (x as i32 + y as i32) % 2 == 0 && y as i32 % 2 == 1 {
-            c = Rgb::hex(0x1C1B22);
-        }
-        let led = ((x - 114.0).powi(2) + (y - 57.5).powi(2)).sqrt();
-        if led < 1.1 {
-            return Rgb::hex(0xFF3B4A);
-        }
-        if led < 2.6 {
-            c = c.add(Rgb::hex(0xFF3B4A).mul(0.25 * (2.6 - led)));
-        }
-        return lit(c, x, y, glow, t).mul(0.9);
-    }
-    // Rabbit-ear antenna.
-    for (bx, by) in [(66.0f32, 0.6f32), (95.0, 1.2)] {
-        if seg_dist(x, y, 80.0, 6.0, bx, by) < 0.55 {
-            return Rgb::hex(0x4A4A56);
-        }
-        if ((x - bx).powi(2) + (y - by).powi(2)).sqrt() < 1.1 {
-            return Rgb::hex(0x7A7A88);
-        }
-    }
-
-    // Console next to the TV, with a breathing LED.
-    if rrect(x, y, 127.0, 56.5, 11.0, 4.5, 1.0) {
-        let led = ((x - 136.0).powi(2) + (y - 58.6).powi(2)).sqrt() < 0.7;
-        if led {
-            return pal::GREEN.mul(0.5 + 0.5 * (t * 2.0).sin().abs());
-        }
-        let c = if (y - 58.6).abs() < 0.4 && x > 129.0 && x < 133.0 { Rgb::hex(0x2A2A33) } else { Rgb::hex(0xCFCBD8).mul(0.55) };
-        return lit(c, x, y, glow, t);
-    }
-    // Cabinet.
-    if x > 24.0 && x < 140.0 && y >= 61.0 && y < 71.0 {
-        let mut c = Rgb::hex(0x3B2416);
-        if y < 62.0 {
-            c = Rgb::hex(0x5A3926);
-        }
-        if (x - 82.0).abs() < 0.4 || ((x - 78.5).powi(2) + (y - 66.0).powi(2)).sqrt() < 0.7 || ((x - 85.5).powi(2) + (y - 66.0).powi(2)).sqrt() < 0.7 {
-            c = c.mul(0.6);
-        }
-        return lit(c, x, y, glow, t);
-    }
-
-    // Window with a night city.
-    if x > 0.0 && x < 30.0 && y > 4.0 && y < 42.0 {
-        if !(x > 4.0 && x < 26.0 && y > 7.0 && y < 39.0) || (x - 15.0).abs() < 0.5 || (y - 22.0).abs() < 0.5 {
-            return lit(Rgb::hex(0x2D2850), x, y, glow, t);
-        }
-        let moon = ((x - 10.0).powi(2) + (y - 12.0).powi(2)).sqrt();
-        if moon < 2.6 {
-            return Rgb::hex(0xF2E7C2);
-        }
-        let mut c = Rgb::hex(0x070B26).lerp(Rgb::hex(0x1A2756), (y - 7.0) / 32.0).add(Rgb::hex(0x302A10).mul((4.0 - moon).max(0.0) / 4.0));
-        let col = (x / 3.0) as u32;
-        let top = 26.0 + (hash(col, 7) % 9) as f32;
-        if y > top {
-            c = Rgb::hex(0x0A0D24);
-            let (wx, wy) = (x as u32, y as u32);
-            if wx % 2 == 0 && wy % 2 == 0 && hash(wx, wy) % 5 == 0 {
-                let on = hash(wx, wy + (t * 0.2) as u32) % 7 != 0;
-                if on {
-                    c = Rgb::hex(0xFFCF73).mul(0.8);
+    for y in 0..cv.h {
+        for x in 0..cv.w {
+            let (u, v) = (ox + x as f32 / s, oy + y as f32 / s);
+            let a = sample(&art.room_a, u, v);
+            let b = sample(&art.room_b, u, v);
+            let lit = Rgb(a[0], a[1], a[2]).mul(bulb).add(Rgb(b[0] * glow.0, b[1] * glow.1, b[2] * glow.2).mul(tv));
+            let mut c = grade(lit);
+            if b[3] > 0.01 {
+                // TV glass: dim phosphor in the glow color, pixel scanlines, grain, and the room's
+                // reflection from the bulb pass.
+                let grain = (hash(x as u32 ^ frame.wrapping_mul(7919), y as u32) % 100) as f32 * 0.0004;
+                let line = if y % 2 == 1 { 0.72 } else { 1.0 };
+                let g = glass_base.mul(line).add(Rgb(a[0], a[1], a[2]).mul(0.3 * bulb)).add(Rgb(grain, grain, grain));
+                c = c.lerp(g, b[3]);
+                if b[3] > 0.5 {
+                    bb = (bb.0.min(x), bb.1.min(y), bb.2.max(x), bb.3.max(y));
                 }
             }
-        } else {
-            let (ix, iy) = (x as u32, y as u32);
-            if hash(ix * 3, iy * 5) % 97 == 0 {
-                c = c.add(Rgb(0.6, 0.6, 0.7).mul(0.5 + 0.5 * (t * 1.7 + ix as f32).sin()));
-            }
+            let (vx, vy) = (x as f32 / w - 0.5, y as f32 / h - 0.5);
+            cv.set(x, y, c.mul(1.0 - (vx * vx + vy * vy) * 0.8));
         }
-        return c;
     }
-    // Curtains.
-    if (x > -4.0 && x < 4.0 || x > 26.0 && x < 33.0) && y > 2.0 && y < 46.0 {
-        return lit(Rgb::hex(0x47152E).mul(0.8 + 0.2 * (x * 2.4).sin()), x, y, glow, t);
-    }
-    // Poster: the show's own key art.
-    if x > 136.0 && x < 151.0 && y > 8.0 && y < 31.0 {
-        let frame = x < 137.0 || x > 150.0 || y < 9.0 || y > 30.0;
-        let c = if frame {
-            Rgb::hex(0x2B2748)
-        } else if ((x - 143.5).abs() + (y - 18.5).abs()) < 5.0 {
-            pal::GOLD
-        } else if (x as i32 + y as i32) % 3 == 0 && (y < 11.0 || y > 27.0) {
-            pal::BULB
-        } else {
-            pal::PODIUM
-        };
-        return lit(c.mul(0.75), x, y, glow, t);
-    }
-    // Floor lamp.
-    let shade_w = 4.0 + (y - 15.0) * 0.35;
-    if y > 15.0 && y < 25.0 && (x - 157.0).abs() < shade_w {
-        return pal::LAMP.lerp(pal::INK, 0.15 * (1.0 - (y - 15.0) / 10.0));
-    }
-    if (x - 157.0).abs() < 0.6 && y >= 25.0 && y < 66.0 {
-        return Rgb::hex(0x2A2A30);
-    }
+    Shot { cv, glass: bb }
+}
 
-    // Wall, baseboard, floor and rug.
-    let c = if y < 63.0 {
-        let base = pal::WALL_TOP.lerp(pal::WALL_BOT, y / 63.0);
-        if (x / 5.0) as i32 % 2 == 0 { base.mul(1.07) } else { base }
-    } else if y < 65.0 {
-        Rgb::hex(0x2A2442)
-    } else if ((x - 80.0) / 72.0).powi(2) + ((y - 84.0) / 10.0).powi(2) < 1.0 {
-        let ring = ((x - 80.0) / 72.0).powi(2) + ((y - 84.0) / 10.0).powi(2) > 0.8;
-        if ring { Rgb::hex(0x5A2448) } else { Rgb::hex(0x3A1A36) }
-    } else {
-        let plank = (y - 65.0) / 3.0;
-        let joint = ((x + (plank as i32 % 3) as f32 * 13.0) / 26.0).fract() < 0.03;
-        if plank.fract() < 0.12 || joint { pal::FLOOR.mul(0.75) } else { pal::FLOOR }
+/// Grimy film grade: gentle S-curve, warm highlights, shadows lifted toward olive.
+fn grade(c: Rgb) -> Rgb {
+    let s = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        v * 0.6 + v * v * (3.0 - 2.0 * v) * 0.4
     };
-    let mut c = lit(c, x, y, glow, t);
-    // Pool of TV light on the floor.
-    if y > 65.0 {
-        let k = ((x - 80.0) / 50.0).powi(2) + ((y - 68.0) / 6.0).powi(2);
-        if k < 1.0 {
-            c = c.add(glow.mul(0.12 * (1.0 - k)));
-        }
+    Rgb(s(c.0), s(c.1) * 0.97, s(c.2) * 0.86).add(Rgb::hex(0x0C0D09))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn room_shot_frames_the_tv_and_dolly_fills_it() {
+        let a = Rect::new(0, 0, 120, 36);
+        let sr = draw(a, 0.0, 1.0, pal::INK).screen(a);
+        assert!(sr.width > a.width / 4 && sr.width < a.width * 2 / 3, "TV glass is a big part of the room shot");
+        assert!(sr.x > a.x && sr.right() < a.right(), "and fully inside it");
+        let end = draw(a, 1.0, 1.0, pal::INK).screen(a);
+        assert_eq!((end.width, end.height), (a.width, a.height), "the dolly ends inside the glass");
     }
-    c
 }

@@ -1,6 +1,8 @@
-//! Pixel canvas drawn with half-block cells, color math, easing curves, a 5x7 pixel font,
-//! and buffer-level effects (shake, flash tint).
+//! Pixel canvas drawn with half-block cells, color math, easing curves, the display font,
+//! image drawing, and buffer-level effects (shake, flash tint, CRT glass).
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
+
+use crate::art::{self, Img};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rgb(pub f32, pub f32, pub f32);
@@ -43,33 +45,28 @@ impl Rgb {
     }
 }
 
+/// Grimy basement palette: concrete, rust, bone-white paint, hazard amber, one bare bulb.
 pub mod pal {
     use super::Rgb;
-    // Living room
-    pub const WALL_TOP: Rgb = Rgb::hex(0x14122C);
-    pub const WALL_BOT: Rgb = Rgb::hex(0x1F1A3E);
-    pub const FLOOR: Rgb = Rgb::hex(0x281912);
-    pub const LAMP: Rgb = Rgb::hex(0xFFB24E);
-    pub const TV_BODY: Rgb = Rgb::hex(0x2C2B34);
-    pub const COUCH: Rgb = Rgb::hex(0x2E1A33);
-    // Studio
-    pub const STAGE: Rgb = Rgb::hex(0x2235B0);
-    pub const STAGE_DEEP: Rgb = Rgb::hex(0x0A0F45);
-    pub const BULB: Rgb = Rgb::hex(0xFFD25A);
-    pub const BULB_OFF: Rgb = Rgb::hex(0x5A4A2A);
-    pub const PODIUM: Rgb = Rgb::hex(0xC8243C);
-    pub const PODIUM_DARK: Rgb = Rgb::hex(0x7E1428);
-    pub const INK: Rgb = Rgb::hex(0xF6F1E4);
-    pub const DIM: Rgb = Rgb::hex(0x98A2E6);
-    pub const GOLD: Rgb = Rgb::hex(0xFFC23A);
-    pub const ORANGE: Rgb = Rgb::hex(0xFF8A2A);
-    pub const RED: Rgb = Rgb::hex(0xFF4058);
-    pub const GREEN: Rgb = Rgb::hex(0x4BE38A);
-    pub const BLACK: Rgb = Rgb::hex(0x05060F);
+    pub const STAGE_DEEP: Rgb = Rgb::hex(0x121210);
+    pub const PANEL: Rgb = Rgb::hex(0x1C1B16);
+    pub const BULB: Rgb = Rgb::hex(0xFFC56A);
+    pub const BULB_OFF: Rgb = Rgb::hex(0x3A3024);
+    pub const PODIUM: Rgb = Rgb::hex(0x7A2A1E);
+    pub const PODIUM_DARK: Rgb = Rgb::hex(0x3E1810);
+    pub const WOOD: Rgb = Rgb::hex(0x5E4329);
+    pub const INK: Rgb = Rgb::hex(0xE8E0C8);
+    pub const DIM: Rgb = Rgb::hex(0x8F8A74);
+    pub const GOLD: Rgb = Rgb::hex(0xE2A42C);
+    pub const ORANGE: Rgb = Rgb::hex(0xC7562A);
+    pub const RED: Rgb = Rgb::hex(0xD0352B);
+    pub const GREEN: Rgb = Rgb::hex(0x8CC24A);
+    pub const BLACK: Rgb = Rgb::hex(0x080807);
 }
 
+/// Player hues; contestant sprite `i` in the art wears hue `i` (same list in tools/scene.py).
 const HUES: [u32; 8] = [
-    0xFF5A4E, 0x3EC6FF, 0x9BE34A, 0xFF9F1C, 0xFF4FB7, 0xA88BFF, 0x3EE6B0, 0xF5E663,
+    0xD9533E, 0x4FA3C7, 0x8DB33A, 0xE39B2D, 0xC75B8E, 0x8C7BC9, 0x46B59A, 0xD8CB5A,
 ];
 
 pub fn hue(i: u8) -> Rgb {
@@ -150,13 +147,6 @@ impl Canvas {
             }
         }
     }
-    pub fn fill(&mut self, f: impl Fn(i32, i32) -> Rgb) {
-        for y in 0..self.h {
-            for x in 0..self.w {
-                self.px[(y * self.w + x) as usize] = f(x, y);
-            }
-        }
-    }
     /// Soft radial light, additive.
     pub fn light(&mut self, cx: f32, cy: f32, r: f32, c: Rgb, a: f32) {
         let (x0, x1) = ((cx - r) as i32, (cx + r) as i32);
@@ -170,15 +160,81 @@ impl Canvas {
             }
         }
     }
+    /// Draw `src` (x, y, w, h in image pixels) of `img` into `dst` (canvas pixels), alpha-blended,
+    /// each pixel passed through `tint`.
+    pub fn img(&mut self, img: &Img, src: (f32, f32, f32, f32), dst: (f32, f32, f32, f32), tint: &dyn Fn(Rgb) -> Rgb) {
+        let (kx, ky) = (src.2 / dst.2, src.3 / dst.3);
+        for py in dst.1.floor() as i32..(dst.1 + dst.3).ceil() as i32 {
+            for px in dst.0.floor() as i32..(dst.0 + dst.2).ceil() as i32 {
+                if px < 0 || py < 0 || px >= self.w || py >= self.h {
+                    continue;
+                }
+                let u0 = src.0 + (px as f32 - dst.0).max(0.0) * kx;
+                let v0 = src.1 + (py as f32 - dst.1).max(0.0) * ky;
+                let u1 = (src.0 + (px as f32 + 1.0 - dst.0) * kx).min(src.0 + src.2);
+                let v1 = (src.1 + (py as f32 + 1.0 - dst.1) * ky).min(src.1 + src.3);
+                let p = img.area(u0, v0, u1, v1);
+                if p[3] > 0.01 {
+                    self.blend(px, py, tint(art::rgb(p)), p[3]);
+                }
+            }
+        }
+    }
+
+    /// Fill the whole canvas with `img` scaled to cover it (cropping the overflow), centered.
+    pub fn cover(&mut self, img: &Img, tint: &dyn Fn(Rgb) -> Rgb) {
+        let s = (self.w as f32 / img.w as f32).max(self.h as f32 / img.h as f32);
+        let (sw, sh) = (self.w as f32 / s, self.h as f32 / s);
+        let src = ((img.w as f32 - sw) / 2.0, (img.h as f32 - sh) / 2.0, sw, sh);
+        self.img(img, src, (0.0, 0.0, self.w as f32, self.h as f32), tint);
+    }
+
+    /// Quantize to 6 bits per channel with a 4x4 ordered dither (a PS1-style grain, kept finer
+    /// than the real 5 bits because terminal pixels are huge), then draw as half-block cells:
+    /// one pixel per column, two per row.
     pub fn blit(&self, buf: &mut Buffer, area: Rect) {
+        const BAYER: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+        let dither = |c: Rgb, x: i32, y: i32| {
+            let b = BAYER[((y & 3) * 4 + (x & 3)) as usize] as f32 / 16.0;
+            let q = |v: f32| (v.clamp(0.0, 1.0) * 63.0 + b).floor() / 63.0;
+            Rgb(q(c.0), q(c.1), q(c.2)).color()
+        };
         for cy in 0..area.height {
             for cx in 0..area.width {
                 let (x, y) = (cx as i32, cy as i32 * 2);
                 let cell = &mut buf[(area.x + cx, area.y + cy)];
                 cell.set_symbol("▀");
-                cell.fg = self.get(x, y).color();
-                cell.bg = self.get(x, y + 1).color();
+                cell.fg = dither(self.get(x, y), x, y);
+                cell.bg = dither(self.get(x, y + 1), x, y + 1);
             }
+        }
+    }
+}
+
+/// Looking at everything through the CRT glass: rounded tube corners, vignette, scanlines
+/// (the lower pixel of every cell is dimmer), a slow rolling bar and a faint 60 Hz flicker.
+pub fn crt_glass(buf: &mut Buffer, a: Rect, t: f32) {
+    let (w, h) = (a.width as f32, a.height as f32);
+    let band = (t * 0.11).fract() * 1.5 - 0.25;
+    let flick = 1.0 + 0.015 * (t * 59.0).sin();
+    for row in 0..a.height {
+        let fy = (row as f32 + 0.5) / h;
+        let ny = fy * 2.0 - 1.0;
+        let roll = 1.0 + 0.06 * (1.0 - ((fy - band) / 0.07).abs()).max(0.0);
+        for col in 0..a.width {
+            let nx = (col as f32 + 0.5) / w * 2.0 - 1.0;
+            let edge = (nx.abs().powi(20) + ny.abs().powi(20)).powf(1.0 / 20.0);
+            let cell = &mut buf[(a.x + col, a.y + row)];
+            if edge > 1.0 {
+                cell.set_char(' ');
+                cell.fg = pal::BLACK.color();
+                cell.bg = pal::BLACK.color();
+                continue;
+            }
+            let rim = 1.0 - 0.6 * ((edge - 0.95) / 0.05).clamp(0.0, 1.0);
+            let k = (1.0 - 0.3 * (nx * nx * 0.6 + ny * ny)) * flick * roll * rim;
+            cell.fg = Rgb::from_color(cell.fg).mul(k).color();
+            cell.bg = Rgb::from_color(cell.bg).mul(k * 0.82).color();
         }
     }
 }
@@ -255,84 +311,40 @@ pub fn shift(buf: &mut Buffer, area: Rect, dx: i32, dy: i32) {
     }
 }
 
-// ---------- 5x7 pixel font ----------
+// ---------- display font ----------
+// Bahnschrift Bold Condensed, distressed, baked by tools/bake.py. `scale` keeps the old 5x7
+// meaning: caps are 7 * scale pixels tall.
 
-fn glyph(c: char) -> &'static str {
-    match c.to_ascii_uppercase() {
-        'A' => ".###.|#...#|#...#|#####|#...#|#...#|#...#",
-        'B' => "####.|#...#|#...#|####.|#...#|#...#|####.",
-        'C' => ".###.|#...#|#....|#....|#....|#...#|.###.",
-        'D' => "####.|#...#|#...#|#...#|#...#|#...#|####.",
-        'E' => "#####|#....|#....|####.|#....|#....|#####",
-        'F' => "#####|#....|#....|####.|#....|#....|#....",
-        'G' => ".###.|#...#|#....|#.###|#...#|#...#|.####",
-        'H' => "#...#|#...#|#...#|#####|#...#|#...#|#...#",
-        'I' => ".###.|..#..|..#..|..#..|..#..|..#..|.###.",
-        'J' => "..###|...#.|...#.|...#.|...#.|#..#.|.##..",
-        'K' => "#...#|#..#.|#.#..|##...|#.#..|#..#.|#...#",
-        'L' => "#....|#....|#....|#....|#....|#....|#####",
-        'M' => "#...#|##.##|#.#.#|#.#.#|#...#|#...#|#...#",
-        'N' => "#...#|#...#|##..#|#.#.#|#..##|#...#|#...#",
-        'O' => ".###.|#...#|#...#|#...#|#...#|#...#|.###.",
-        'P' => "####.|#...#|#...#|####.|#....|#....|#....",
-        'Q' => ".###.|#...#|#...#|#...#|#.#.#|#..#.|.##.#",
-        'R' => "####.|#...#|#...#|####.|#.#..|#..#.|#...#",
-        'S' => ".####|#....|#....|.###.|....#|....#|####.",
-        'T' => "#####|..#..|..#..|..#..|..#..|..#..|..#..",
-        'U' => "#...#|#...#|#...#|#...#|#...#|#...#|.###.",
-        'V' => "#...#|#...#|#...#|#...#|#...#|.#.#.|..#..",
-        'W' => "#...#|#...#|#...#|#.#.#|#.#.#|#.#.#|.#.#.",
-        'X' => "#...#|#...#|.#.#.|..#..|.#.#.|#...#|#...#",
-        'Y' => "#...#|#...#|.#.#.|..#..|..#..|..#..|..#..",
-        'Z' => "#####|....#|...#.|..#..|.#...|#....|#####",
-        '0' => ".###.|#...#|#..##|#.#.#|##..#|#...#|.###.",
-        '1' => "..#..|.##..|..#..|..#..|..#..|..#..|.###.",
-        '2' => ".###.|#...#|....#|...#.|..#..|.#...|#####",
-        '3' => "####.|....#|....#|.###.|....#|....#|####.",
-        '4' => "...#.|..##.|.#.#.|#..#.|#####|...#.|...#.",
-        '5' => "#####|#....|####.|....#|....#|#...#|.###.",
-        '6' => ".###.|#....|#....|####.|#...#|#...#|.###.",
-        '7' => "#####|....#|...#.|..#..|.#...|.#...|.#...",
-        '8' => ".###.|#...#|#...#|.###.|#...#|#...#|.###.",
-        '9' => ".###.|#...#|#...#|.####|....#|....#|.###.",
-        '!' => "..#..|..#..|..#..|..#..|..#..|.....|..#..",
-        '?' => ".###.|#...#|....#|...#.|..#..|.....|..#..",
-        '.' => ".....|.....|.....|.....|.....|.....|..#..",
-        ',' => ".....|.....|.....|.....|.....|..#..|.#...",
-        '-' => ".....|.....|.....|.###.|.....|.....|.....",
-        '+' => ".....|..#..|..#..|#####|..#..|..#..|.....",
-        ':' => ".....|..#..|..#..|.....|..#..|..#..|.....",
-        '\'' => "..#..|..#..|.#...|.....|.....|.....|.....",
-        '/' => "....#|...#.|...#.|..#..|.#...|.#...|#....",
-        '*' => ".....|#.#.#|.###.|#####|.###.|#.#.#|.....",
-        ' ' => ".....|.....|.....|.....|.....|.....|.....",
-        _ => ".###.|#...#|....#|...#.|..#..|.....|..#..",
-    }
+fn font_k(scale: i32) -> f32 {
+    (7 * scale) as f32 / art::get().font.cap
 }
 
 pub fn big_width(s: &str, scale: i32) -> i32 {
-    let n = s.chars().count() as i32;
-    if n == 0 { 0 } else { n * 6 * scale - scale }
+    let (f, k) = (&art::get().font, font_k(scale));
+    (s.chars().map(|c| f.glyph(c.to_ascii_uppercase()).1).sum::<f32>() * k).ceil() as i32
 }
 
 impl Canvas {
-    /// Draw pixel text; `fill(px, py)` colors each lit pixel in text-local coordinates.
+    /// Draw display text; `fill(px, py)` colors each pixel in text-local coordinates.
     pub fn big(&mut self, x: i32, y: i32, s: &str, scale: i32, fill: &dyn Fn(i32, i32) -> Rgb) {
-        for (i, ch) in s.chars().enumerate() {
-            let ox = x + i as i32 * 6 * scale;
-            for (row, line) in glyph(ch).split('|').enumerate() {
-                for (col, b) in line.bytes().enumerate() {
-                    if b != b'#' {
-                        continue;
-                    }
-                    for sy in 0..scale {
-                        for sx in 0..scale {
-                            let (lx, ly) = (i as i32 * 6 * scale + col as i32 * scale + sx, row as i32 * scale + sy);
-                            self.set(ox + col as i32 * scale + sx, y + row as i32 * scale + sy, fill(lx, ly));
-                        }
+        let (f, k) = (&art::get().font, font_k(scale));
+        let rows = (f.img.h as f32 * k).ceil() as i32;
+        let mut pen = 0.0f32;
+        for ch in s.chars() {
+            let (gx, adv) = f.glyph(ch.to_ascii_uppercase());
+            let left = (x as f32 + pen - f.pad * k).floor() as i32;
+            let cols = ((adv + 2.0 * f.pad) * k).ceil() as i32;
+            for ty in 0..rows {
+                for tx in 0..cols {
+                    let (u, v) = (gx + tx as f32 / k, ty as f32 / k);
+                    let cov = f.img.area(u, v, u + 1.0 / k, v + 1.0 / k)[3];
+                    if cov > 0.04 {
+                        let (px, py) = (left + tx, y + ty);
+                        self.blend(px, py, fill(px - x, py - y), (cov * 1.3).min(1.0));
                     }
                 }
             }
+            pen += adv * k;
         }
     }
 
@@ -364,11 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn every_glyph_is_5x7() {
-        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?.,-+:'/* ".chars() {
-            let rows: Vec<_> = glyph(c).split('|').collect();
-            assert_eq!(rows.len(), 7, "{c}");
-            assert!(rows.iter().all(|r| r.len() == 5), "{c}");
-        }
+    fn display_text_lands_inside_its_width() {
+        let mut cv = Canvas { w: 120, h: 30, px: vec![pal::BLACK; 120 * 30] };
+        let w = big_width("GO!", 2);
+        assert!(w > 10 && w < 60);
+        cv.big(4, 4, "GO!", 2, &|_, _| pal::INK);
+        let lit: Vec<i32> = (0..120).filter(|&x| (0..30).any(|y| cv.get(x, y) != pal::BLACK)).collect();
+        assert!(!lit.is_empty());
+        assert!(*lit.first().unwrap() >= 0 && *lit.last().unwrap() <= 4 + w + 2);
     }
 }

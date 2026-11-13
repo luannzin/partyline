@@ -12,7 +12,11 @@ terminal (TUI). Not web, not native mobile. Renders in a truecolor terminal (Win
 
 ## Stack
 
-Rust, ratatui + crossterm, tachyonfx for effects, iroh for peer-to-peer networking. Chosen by the user in the original brief (Rust + ratatui) with networking delegated.
+Rust, ratatui + crossterm, iroh for peer-to-peer networking. Chosen by the user in the original brief (Rust + ratatui) with networking delegated. Art is rendered offline in Blender and baked with Python (`tools/`); the user asked to keep the game in Rust for performance and use Python for assets.
+
+## Visual reference
+
+The user pointed at Machine Party (Mike Klubnika & GDeavid) and Pummel Party: low-poly 3D, PS1 grain, grim humor, contestants in improvised hats, a CRT in a 3D room that the camera moves into. Take the mood and the genre, never its characters, names, logo or art.
 
 ## Users
 

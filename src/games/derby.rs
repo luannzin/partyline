@@ -134,10 +134,10 @@ impl S {
         for (i, &(p, n)) in self.progress.iter().enumerate() {
             let y = top + i as i32 * lane_h;
             let mine = p == v.me || p == v.cam;
-            let lane = if i % 2 == 0 { Rgb::hex(0x0C124E) } else { Rgb::hex(0x101860) };
+            let lane = if i % 2 == 0 { Rgb::hex(0x16150F) } else { Rgb::hex(0x1C1A13) };
             cv.rect(0, y, cv.w, lane_h, if mine { lane.lerp(v.hue(p), 0.12) } else { lane });
             for x in (x0..x1).step_by(4) {
-                cv.set(x, y + lane_h - 1, Rgb::hex(0x1C2577));
+                cv.set(x, y + lane_h - 1, Rgb::hex(0x2C291F));
             }
             // Finish line checker.
             for yy in y..y + lane_h {

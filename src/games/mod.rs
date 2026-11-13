@@ -196,30 +196,13 @@ impl Local {
     }
 }
 
-/// Studio stage backdrop: royal blue radial, two sweeping spotlights, darker floor band.
+/// Backdrop inside the TV: the pre-rendered test chamber under its bare bulb, which buzzes and
+/// now and then browns out. `energy` brightens it (0 = dim behind a busy game, 1 = the finale).
 pub fn stage(area: Rect, t: f32, energy: f32) -> Canvas {
-    let mut cv = Canvas::for_area(area, pal::STAGE_DEEP);
-    let (w, h) = (cv.w as f32, cv.h as f32);
-    let beams = [(0.1f32, 1.0f32, 0.0f32), (0.9, 2.14, 2.1)];
-    cv.fill(|x, y| {
-        let (nx, ny) = (x as f32 / w, y as f32 / h);
-        let (fx, fy) = (nx - 0.5, ny - 0.42);
-        let d = (fx * fx * 1.1 + fy * fy * 1.8).sqrt();
-        let mut c = pal::STAGE.lerp(pal::STAGE_DEEP, (d * 1.7).min(1.0) * (1.0 - energy * 0.25));
-        if ny > 0.8 {
-            c = c.mul(0.78);
-        }
-        for (sx, base, ph) in beams {
-            let ang = base + 0.2 * (t * 0.33 + ph).sin();
-            let (dx, dy) = ((nx - sx) * w / h, ny + 0.12);
-            let diff = (dy.atan2(dx) - ang).abs();
-            if diff < 0.11 {
-                let k = (1.0 - diff / 0.11) * (1.15 - ny).max(0.0) * (0.55 + energy * 0.5);
-                c = c.add(Rgb(0.09, 0.11, 0.22).mul(k));
-            }
-        }
-        c
-    });
+    let mut cv = Canvas::for_area(area, pal::BLACK);
+    let brownout = if crate::gfx::hash((t * 7.0) as u32, 11) % 71 == 0 { 0.6 } else { 1.0 };
+    let k = (0.5 + energy * 0.6) * brownout * (1.0 + 0.04 * (t * 13.0).sin() * (t * 4.1).sin());
+    cv.cover(&crate::art::get().chamber, &|c| c.mul(k));
     cv
 }
 

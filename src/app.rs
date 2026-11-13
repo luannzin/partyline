@@ -12,7 +12,7 @@ use crate::games::{Fx, Game, Local, View, derby};
 use crate::gfx::{self, Rgb, big_width, ctext, ease_in_out, hash, hue, pal, prog, text, text_bg};
 use crate::net::{self, Conn, Lan, Net, RoomAd};
 use crate::proto::{ClientMsg, Dir, Event, Input, Kind, Phase, Pid, ServerMsg, Session};
-use crate::room::{self, Cam};
+use crate::room;
 use crate::server::{self, Cmd};
 use crate::sfx::{Sfx, Sound};
 use crate::studio;
@@ -28,6 +28,8 @@ const ZOOM_IN: f32 = 0.7;
 const ZOOM_OUT: f32 = 0.55;
 const POWER_ON: f32 = 0.26;
 const POWER_OFF: f32 = 0.32;
+/// The idle CRT's cold blue-white light.
+const TV_COLD: Rgb = Rgb::hex(0xA9C4D6);
 
 #[derive(Clone, PartialEq)]
 enum Page {
@@ -161,7 +163,7 @@ impl App {
             net: None,
             net_rx: Some(net_rx),
             net_err: None,
-            glow: pal::STAGE,
+            glow: TV_COLD,
             mode: Mode::Room,
             pending: None,
             conn: None,
@@ -300,13 +302,13 @@ impl App {
             self.session = None;
         }
 
-        // Ambient TV glow follows the highlighted menu item.
+        // The TV's light in the room follows the highlighted menu item.
         let target = match (&self.page, self.sel) {
-            (Page::Main, 0) | (Page::Host, _) => pal::STAGE.lerp(pal::GOLD, 0.45),
-            (Page::Main, 1) | (Page::Join | Page::Code | Page::Password, _) => pal::STAGE.lerp(Rgb::hex(0x3EC6FF), 0.5),
-            (Page::Main, 2) => pal::STAGE.lerp(Rgb::hex(0xFF4FB7), 0.45),
-            (Page::Main, _) | (Page::Error(_), _) => pal::STAGE.lerp(pal::RED, 0.45),
-            _ => pal::STAGE,
+            (Page::Main, 0) | (Page::Host, _) => TV_COLD.lerp(pal::GOLD, 0.6),
+            (Page::Main, 1) | (Page::Join | Page::Code | Page::Password, _) => TV_COLD.lerp(hue(1), 0.6),
+            (Page::Main, 2) => TV_COLD.lerp(hue(4), 0.6),
+            (Page::Main, _) | (Page::Error(_), _) => TV_COLD.lerp(pal::RED, 0.65),
+            _ => TV_COLD,
         };
         self.glow = self.glow.lerp(target, 1.0 - (-dt * 9.0).exp());
         self.fx.flash *= (-dt * 7.0).exp();
@@ -761,15 +763,11 @@ impl App {
         }
         let t = self.t();
         match self.mode {
-            Mode::Room => self.draw_room(buf, a, Cam::room(), 0.0, true),
-            Mode::ZoomIn(s) => {
-                let p = ease_in_out(prog(t, s, ZOOM_IN));
-                self.draw_room(buf, a, Cam::lerp(Cam::room(), Cam::tv(a), p), p, false);
-            }
+            Mode::Room => self.draw_room(buf, a, 0.0, true),
+            Mode::ZoomIn(s) => self.draw_room(buf, a, ease_in_out(prog(t, s, ZOOM_IN)), false),
             Mode::ZoomOut(s) => {
                 let p = ease_in_out(prog(t, s, ZOOM_OUT));
-                let show_menu = p > 0.9;
-                self.draw_room(buf, a, Cam::lerp(Cam::tv(a), Cam::room(), p), 1.0 - p, show_menu);
+                self.draw_room(buf, a, 1.0 - p, p > 0.9);
             }
             Mode::Studio(s) => {
                 self.draw_studio(buf, a, t);
@@ -782,36 +780,30 @@ impl App {
         }
     }
 
-    fn draw_room(&mut self, buf: &mut Buffer, a: Rect, cam: Cam, zoom_p: f32, menu: bool) {
+    /// The room, `p` of the way along the dolly into the TV; `menu` draws the TV menu on the glass.
+    fn draw_room(&mut self, buf: &mut Buffer, a: Rect, p: f32, menu: bool) {
         let t = self.t();
-        let glow = self.glow.lerp(pal::STAGE.mul(1.3), zoom_p);
-        let mut cv = room::draw(a, cam, t, glow);
-        let sr = room::screen_rect(a, cam);
-        let logo_big = menu && sr.width >= 60 && sr.height >= 14;
-        if logo_big {
+        let mut shot = room::draw(a, p, t, self.glow);
+        let sr = shot.screen(a);
+        // Logo rows on the glass: 0 = none, else the display-font scale.
+        let logo = if !menu || sr.width < 24 || sr.height < 10 { 0 } else if sr.height >= 20 && sr.width >= 44 { 2 } else { 1 };
+        if logo > 0 {
             let (ox, oy) = ((sr.x - a.x) as i32, (sr.y - a.y) as i32 * 2);
-            let w = big_width("PARTYLINE", 1);
-            cv.big_center(ox + sr.width as i32 / 2, oy + 4, "PARTYLINE", 1, &|x, y| {
+            let w = big_width("PARTYLINE", logo);
+            shot.cv.big_center(ox + sr.width as i32 / 2, oy + 4, "PARTYLINE", logo, &|x, y| {
                 let sweep = ((t * 0.4).fract() * (w + 30) as f32) as i32 - 15;
-                let c = pal::BULB.lerp(pal::ORANGE, y as f32 / 7.0);
+                let c = pal::INK.lerp(pal::GOLD, y as f32 / (7 * logo) as f32);
                 if (x + y / 2 - sweep).abs() < 2 { c.lerp(pal::INK, 0.7) } else { c }
             });
         }
-        cv.blit(buf, a);
+        shot.cv.blit(buf, a);
         if menu && sr.width > 10 && sr.height > 6 {
-            self.draw_menu(buf, sr, t, logo_big);
+            self.draw_menu(buf, sr, t, if logo > 0 { (4 + 7 * logo) / 2 + 1 } else { 0 });
         }
     }
 
-    fn draw_menu(&mut self, buf: &mut Buffer, sr: Rect, t: f32, logo_big: bool) {
-        // Scanlines.
-        for y in (sr.top()..sr.bottom()).filter(|y| (y - sr.top()) % 2 == 1) {
-            for x in sr.left()..sr.right() {
-                let c = &mut buf[(x, y)];
-                c.fg = Rgb::from_color(c.fg).mul(0.9).color();
-                c.bg = Rgb::from_color(c.bg).mul(0.9).color();
-            }
-        }
+    /// The TV menu inside the glass rect `sr`; `logo_rows` are already taken by the logo.
+    fn draw_menu(&mut self, buf: &mut Buffer, sr: Rect, t: f32, logo_rows: i32) {
         // Channel-change static.
         if t - self.chan_t < 0.14 {
             let seed = (t * 120.0) as u32;
@@ -828,14 +820,14 @@ impl App {
             return;
         }
         let top = sr.y as i32;
-        text(buf, sr, sr.x as i32 + 2, top, "CH 03", pal::DIM);
+        text(buf, sr, sr.x as i32 + 3, top, "CH 03", pal::DIM);
         let live = if (t * 1.4).fract() < 0.6 { pal::RED } else { pal::PODIUM_DARK };
-        text(buf, sr, sr.right() as i32 - 9, top, "● LIVE", live);
+        text(buf, sr, sr.right() as i32 - 9, top, "● REC", live);
         let mut y = top + 1;
-        if logo_big {
-            y += 6;
+        if logo_rows > 0 {
+            y = top + logo_rows;
         } else {
-            ctext(buf, sr, y + 1, "★  P A R T Y L I N E  ★", pal::GOLD);
+            ctext(buf, sr, y + 1, "P A R T Y L I N E", pal::INK);
             y += 3;
         }
         match &self.page {
@@ -928,7 +920,7 @@ impl App {
                 }
             }
             Phase::Results { kind, gains, until } => studio::results(buf, a, s, *kind, gains, *until, now, t, self.phase_since),
-            Phase::Final => studio::finale(buf, a, s, me, host, t, self.phase_since, &mut self.local),
+            Phase::Final => studio::finale(buf, a, s, host, t, self.phase_since, &mut self.local),
         }
         if let Some((msg, t0)) = &self.toast {
             let k = t - t0;
@@ -946,6 +938,7 @@ impl App {
             let dy = (((h >> 4) % 3) as i32 - 1) * (self.fx.shake * 0.8).round() as i32;
             gfx::shift(buf, a, dx, dy);
         }
+        gfx::crt_glass(buf, a, t);
     }
 }
 
@@ -1048,16 +1041,17 @@ mod tests {
             let a = Rect::new(0, 0, w, h);
             let tag = format!("{w}x{h}");
             let mut buf = Buffer::empty(a);
-            app.glow = pal::STAGE.lerp(pal::GOLD, 0.45);
-            app.draw_room(&mut buf, a, Cam::room(), 0.0, true);
+            app.glow = TV_COLD.lerp(pal::GOLD, 0.6);
+            app.draw_room(&mut buf, a, 0.0, true);
             save(&format!("room_{tag}"), &buf);
             let mut buf = Buffer::empty(a);
             app.page = Page::Join;
-            app.draw_room(&mut buf, a, Cam::room(), 0.0, true);
+            app.glow = TV_COLD.lerp(hue(1), 0.6);
+            app.draw_room(&mut buf, a, 0.0, true);
             save(&format!("room_join_{tag}"), &buf);
             app.page = Page::Main;
             let mut buf = Buffer::empty(a);
-            app.draw_room(&mut buf, a, Cam::lerp(Cam::room(), Cam::tv(a), 0.6), 0.6, false);
+            app.draw_room(&mut buf, a, 0.6, false);
             save(&format!("zoom_{tag}"), &buf);
 
             let p = |id, name: &str, hue, link, ready, spectator, score| Player { id, name: name.into(), hue, ready, spectator, score, link, ping: 12 };
@@ -1073,6 +1067,7 @@ mod tests {
             let shot = |name: &str, s: &Session, f: &mut dyn FnMut(&mut Buffer, &Session)| {
                 let mut buf = Buffer::empty(a);
                 f(&mut buf, s);
+                gfx::crt_glass(&mut buf, a, 10.0);
                 save(&format!("{name}_{tag}"), &buf);
             };
             shot("lobby", &s, &mut |b, s| studio::lobby(b, a, s, 1, true, 10.0, &[]));
@@ -1140,7 +1135,7 @@ mod tests {
             shot("results", &s, &mut |b, s| studio::results(b, a, s, Kind::Blink, &gains, 4000, 0, 10.0, 0.0));
             s.phase = Phase::Final;
             let mut l4 = Local::default();
-            shot("final", &s, &mut |b, s| studio::finale(b, a, s, 1, true, 10.0, 0.0, &mut l4));
+            shot("final", &s, &mut |b, s| studio::finale(b, a, s, true, 10.0, 0.0, &mut l4));
             let mut buf = Buffer::empty(a);
             studio::lobby(&mut buf, a, &s, 1, true, 10.0, &[]);
             studio::go(&mut buf, a, 0.3);

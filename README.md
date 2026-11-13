@@ -48,7 +48,21 @@ host, Windows Firewall asks to allow the game: allow it, or LAN players can't fi
 - `src/server.rs`: the host runs the session; every client gets the full state about 30 times a
   second and only sends key presses.
 - `src/games/`: each minigame owns its rules, its bot, and its rendering.
-- `src/room.rs`, `src/studio.rs`: the living room with the TV, and the studio inside it.
+- `src/room.rs`, `src/studio.rs`: the living room with the TV, and the test chamber inside it.
+- `src/art.rs`: the pre-rendered art in `assets/`, embedded in the binary.
+
+## Art
+
+The room, the camera move into the TV, the contestants, the chamber and the display font are
+rendered in Blender and baked by a Python script. The game only needs the baked `assets/`;
+rebuild them after changing `tools/scene.py`:
+
+```bash
+python tools/bake.py
+```
+
+Needs Blender 5.x (set `BLENDER` if it isn't in the default install path), Pillow and numpy.
+`--quick` renders a fast low-quality pass for iterating, `--pack` only repacks.
 
 ## Tests
 

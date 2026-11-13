@@ -3,7 +3,7 @@ use ratatui::buffer::Buffer;
 use serde::{Deserialize, Serialize};
 
 use super::{Fx, Local, View, panel, stage};
-use crate::gfx::{Rgb, big_width, ctext, ease_out, hash, pal, prog, text};
+use crate::gfx::{big_width, ctext, ease_out, hash, pal, prog, text};
 use crate::proto::{Event, Input, Pid};
 
 pub const ROUNDS: u8 = 5;
@@ -154,7 +154,7 @@ impl S {
             let x = x0 + k as i32 * (cw + 2);
             let won = reveal && self.winners.contains(&k);
             let lost = reveal && !self.winners.is_empty() && !won;
-            let mut face = Rgb::hex(0x151C6E);
+            let mut face = pal::PANEL;
             if my == Some(k) {
                 face = face.lerp(pal::GOLD, 0.18);
             }

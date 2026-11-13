@@ -195,7 +195,7 @@ impl S {
             let y = top + row * (th + 1);
             let early = times[r] == Some(EARLY);
             let mut stripe = v.hue(*p);
-            let mut face = Rgb::hex(0x151C6E);
+            let mut face = pal::PANEL;
             if early {
                 stripe = stripe.grey();
                 face = face.grey();

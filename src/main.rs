@@ -1,6 +1,7 @@
 //! PARTYLINE: a terminal party game show. Host a room, friends join over LAN or internet
 //! (no server to run), play a run of minigames, crown a champion.
 mod app;
+mod art;
 mod games;
 mod gfx;
 mod net;
