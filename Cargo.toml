@@ -1,0 +1,23 @@
+[package]
+name = "partyline"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+fastrand = "2"
+font8x8 = "0.3"
+iroh = "1.4"
+iroh-mdns-address-lookup = "0.6"
+n0-future = "0.3"
+postcard = { version = "1", features = ["use-std"] }
+ratatui = "0.30"
+rodio = { version = "0.23", default-features = false, features = ["playback"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
