@@ -2,13 +2,17 @@
 name = "partyline"
 # Bumping this and pushing to main publishes release v<version> (.github/workflows/release.yml),
 # which installed copies then update to.
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 
 [dependencies]
 anyhow = "1"
 # Clipboard without the terminal's help (GNOME's VTE ignores OSC 52).
 arboard = { version = "3", default-features = false }
+# Only to turn on use-dev-tty for ratatui's crossterm: keys are read with poll/select instead of
+# mio, because macOS kqueue can't watch /dev/tty (stdin when install.sh starts the game) and
+# input fails with "Failed to initialize input reader".
+crossterm = { version = "0.29", default-features = false, features = ["use-dev-tty"] }
 fastrand = "2"
 font8x8 = "0.3"
 iroh = "1.4"

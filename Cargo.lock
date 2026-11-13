@@ -597,6 +597,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "filedescriptor",
  "mio",
  "parking_lot",
  "rustix",
@@ -2928,10 +2929,11 @@ dependencies = [
 
 [[package]]
 name = "partyline"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arboard",
+ "crossterm",
  "fastrand",
  "font8x8",
  "iroh",
