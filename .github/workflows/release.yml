@@ -1,0 +1,97 @@
+name: release
+
+# Every push to main whose Cargo.toml version has no release yet builds PartyLine for Windows,
+# Linux and macOS and publishes the binaries as release v<version>; installed copies swap
+# themselves to it on their next start. To ship: bump `version` in Cargo.toml and push.
+# "Run workflow" on the Actions tab builds the same files without publishing.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      new: ${{ steps.v.outputs.new }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.new == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 = oldest glibc we support, so the Linux binary runs on 22.04 and newer.
+        os: [ubuntu-22.04, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --no-self-update && rustup default stable
+
+      - name: Linux (tests, binary)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+          cargo test --release
+          cargo build --release
+          mkdir -p dist && cp target/release/partyline dist/partyline-linux-x86_64
+
+      - name: Windows (binary)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release
+          mkdir -p dist && cp target/release/partyline.exe dist/partyline-windows-x86_64.exe
+
+      - name: macOS (universal binary)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/partyline-macos \
+            target/aarch64-apple-darwin/release/partyline target/x86_64-apple-darwin/release/partyline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: partyline-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    if: github.event_name == 'push' && needs.version.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        # the asset names are what install.sh, install.ps1 and the updater (src/update.rs) download
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "PartyLine $TAG" --generate-notes

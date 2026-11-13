@@ -10,6 +10,7 @@ mod room;
 mod server;
 mod sfx;
 mod studio;
+mod update;
 
 use std::io::stdout;
 use std::time::Duration;
@@ -19,15 +20,16 @@ use ratatui::crossterm::{
     execute,
 };
 
-const HELP: &str = "partyline [--name NAME] [--bots N] [--calm] [--mute]
+const HELP: &str = "partyline [--name NAME] [--bots N] [--calm] [--mute] [--no-update]
 
   --name NAME   your name on the podium (default: your login name)
   --bots N      bots that join rooms you host (0-7, default 0)
   --calm        no screen shake, flashes softened, camera cuts instead of moves
-  --mute        no sound";
+  --mute        no sound
+  --no-update   don't check GitHub for a newer version";
 
 fn main() -> anyhow::Result<()> {
-    let mut args = app::Args { name: default_name(), bots: 0, calm: false, mute: false };
+    let mut args = app::Args { name: default_name(), bots: 0, calm: false, mute: false, update: true };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -35,8 +37,9 @@ fn main() -> anyhow::Result<()> {
             "--bots" => args.bots = it.next().and_then(|n| n.parse().ok()).unwrap_or(0).min(7),
             "--calm" => args.calm = true,
             "--mute" => args.mute = true,
+            "--no-update" => args.update = false,
             _ => {
-                println!("{HELP}");
+                println!("PARTYLINE v{}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
         }

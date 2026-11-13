@@ -22,6 +22,7 @@ pub struct Args {
     pub bots: u8,
     pub calm: bool,
     pub mute: bool,
+    pub update: bool,
 }
 
 const ZOOM_IN: f32 = 0.7;
@@ -112,6 +113,9 @@ pub struct App {
     net: Option<Net>,
     net_rx: Option<oneshot::Receiver<anyhow::Result<Net>>>,
     net_err: Option<String>,
+    update_rx: std::sync::mpsc::Receiver<String>,
+    /// A newer release already swapped in; it runs on the next launch.
+    updated: Option<String>,
     glow: Rgb,
     mode: Mode,
     // Session
@@ -163,6 +167,8 @@ impl App {
             net: None,
             net_rx: Some(net_rx),
             net_err: None,
+            update_rx: crate::update::start(args.update),
+            updated: None,
             glow: TV_COLD,
             mode: Mode::Room,
             pending: None,
@@ -213,6 +219,9 @@ impl App {
         let dt = (t - self.last_t).clamp(0.0, 0.1);
         self.last_t = t;
 
+        if let Ok(tag) = self.update_rx.try_recv() {
+            self.updated = Some(tag);
+        }
         if let Some(rx) = &mut self.net_rx {
             match rx.try_recv() {
                 Ok(Ok(net)) => {
@@ -874,16 +883,18 @@ impl App {
             }
             y += 1;
         }
-        let hint = if self.edit.is_some() {
-            "type · ENTER save · ESC cancel".to_string()
+        let (hint, c) = if self.edit.is_some() {
+            ("type · ENTER save · ESC cancel".to_string(), pal::DIM)
+        } else if let Some(tag) = &self.updated {
+            (format!("{tag} installed · restart to play it"), pal::GOLD)
         } else if let Some(e) = &self.net_err {
-            format!("offline: {}", e.chars().take(sr.width as usize - 12).collect::<String>())
+            (format!("offline: {}", e.chars().take(sr.width as usize - 12).collect::<String>()), pal::DIM)
         } else if self.net.is_none() {
-            "warming up the network…".to_string()
+            ("warming up the network…".to_string(), pal::DIM)
         } else {
-            "↑↓ choose · ENTER select".to_string()
+            ("↑↓ choose · ENTER select".to_string(), pal::DIM)
         };
-        ctext(buf, sr, sr.bottom() as i32 - 1, &hint, pal::DIM);
+        ctext(buf, sr, sr.bottom() as i32 - 1, &hint, c);
     }
 
     fn draw_studio(&mut self, buf: &mut Buffer, a: Rect, t: f32) {
@@ -993,7 +1004,7 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
 /// Turn network errors into something a player can act on.
 fn friendly(e: &anyhow::Error) -> String {
     let raw = e.to_string();
-    if raw.contains("Wrong password") || raw.contains("full") || raw.contains("Timed out") {
+    if ["Wrong password", "full", "Timed out", "PartyLine v"].iter().any(|k| raw.contains(k)) {
         return raw;
     }
     format!("Couldn't reach that room. Check the code, and that the host is still in the lobby. ({})", raw.chars().take(60).collect::<String>())
@@ -1032,7 +1043,7 @@ mod tests {
         use crate::proto::{Link, Player};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut app = App::new(rt.handle().clone(), Args { name: "LUAN".into(), bots: 3, calm: false, mute: true });
+        let mut app = App::new(rt.handle().clone(), Args { name: "LUAN".into(), bots: 3, calm: false, mute: true, update: false });
         let dir = std::path::Path::new("target/snap");
         std::fs::create_dir_all(dir).unwrap();
         let save = |name: &str, buf: &Buffer| std::fs::write(dir.join(format!("{name}.html")), html(buf)).unwrap();

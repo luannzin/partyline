@@ -108,7 +108,7 @@ impl Net {
             .await
             .map_err(|_| anyhow::anyhow!("Timed out reaching the room."))??;
         let (mut send, mut recv) = conn.open_bi().await?;
-        proto::send(&mut send, &ClientMsg::Hello { name, password }).await?;
+        proto::send(&mut send, &ClientMsg::Hello { version: env!("CARGO_PKG_VERSION").into(), name, password }).await?;
         let me = match proto::recv::<ServerMsg>(&mut recv).await? {
             ServerMsg::Welcome { you } => you,
             ServerMsg::Reject(why) => anyhow::bail!(why),
@@ -155,13 +155,20 @@ pub async fn local(server: &Handle, name: String, password: String) -> anyhow::R
 
 async fn serve(conn: Connection, server: Handle) -> anyhow::Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await?;
-    let ClientMsg::Hello { name, password } = proto::recv(&mut recv).await? else {
+    let ClientMsg::Hello { version, name, password } = proto::recv(&mut recv).await? else {
         anyhow::bail!("expected hello");
     };
     let (tx, mut rx) = mpsc::channel(64);
     let (reply, ok) = oneshot::channel();
     let (link, _) = link_of(&conn);
-    server.send(Cmd::Join { name, password, link, tx, reply })?;
+    let ours = env!("CARGO_PKG_VERSION");
+    if version == ours {
+        server.send(Cmd::Join { name, password, link, tx, reply })?;
+    } else {
+        let _ = reply.send(Err(format!(
+            "This room runs PartyLine v{ours} and you have v{version}. Restart PartyLine to update it, or ask the host to."
+        )));
+    }
     let pid = match ok.await? {
         Ok(pid) => {
             proto::send(&mut send, &ServerMsg::Welcome { you: pid }).await?;

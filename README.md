@@ -2,23 +2,46 @@
 
 A party game show that runs in your terminal. One person hosts, friends join over the LAN
 or the internet (no server to run, no port forwarding), everyone plays a run of minigames,
-and a champion gets crowned on the podium.
+and a champion gets crowned on a crate in a grimy basement.
 
-## Run it
+## Play
+
+Nothing to install first. Paste one line into a terminal; it downloads the game and starts it.
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/luannzin/partyline/main/install.ps1 | iex
+```
+
+Linux (x86_64) and macOS:
 
 ```bash
-cargo run --release
+curl -fsSL https://raw.githubusercontent.com/luannzin/partyline/main/install.sh | sh
 ```
+
+After that, just run `partyline`. The Windows script puts it in
+`%LOCALAPPDATA%\Programs\PartyLine` and adds that to your PATH; the Linux/macOS one puts it in
+`~/.local/bin`. Or grab the file for your OS from
+[Releases](https://github.com/luannzin/partyline/releases) and run it (on Windows: **More info →
+Run anyway** the first time, the build isn't signed).
+
+PartyLine updates itself: on start it checks for a newer release, swaps it in, and the TV says
+so; the next launch is the new version. Everyone in a room must run the same version, so if a
+friend can't join, both of you restart once. `--no-update` turns this off.
+
+Flags: `--name NAME`, `--bots N` (bots fill rooms you host), `--calm` (no shake, camera
+cuts instead of moves), `--mute`, `--no-update`.
+
+Use Windows Terminal (or any truecolor terminal) at 80x24 or bigger; bigger looks better. The
+first time you host, Windows Firewall asks to allow the game: allow it, or LAN players can't
+find you. Linux needs ALSA for sound (`libasound2`, already on desktop installs).
+
+## Run from source
 
 ```bash
 cargo run --release -- --bots 3
 ```
-
-Flags: `--name NAME`, `--bots N` (bots fill rooms you host), `--calm` (no shake, camera
-cuts instead of moves), `--mute`.
-
-Use Windows Terminal (or any truecolor terminal) at 80x24 or bigger. The first time you
-host, Windows Firewall asks to allow the game: allow it, or LAN players can't find you.
 
 ## Playing with friends
 
@@ -50,6 +73,13 @@ host, Windows Firewall asks to allow the game: allow it, or LAN players can't fi
 - `src/games/`: each minigame owns its rules, its bot, and its rendering.
 - `src/room.rs`, `src/studio.rs`: the living room with the TV, and the test chamber inside it.
 - `src/art.rs`: the pre-rendered art in `assets/`, embedded in the binary.
+- `src/update.rs`: self-update from GitHub Releases.
+
+## Releases
+
+Bump `version` in `Cargo.toml` and push to `main`. GitHub Actions sees there's no release for
+that version yet, builds Windows, Linux and macOS (universal) binaries and publishes release
+`v<version>`; installed copies pick it up on their next start. No manual tagging.
 
 ## Art
 

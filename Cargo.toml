@@ -1,6 +1,8 @@
 [package]
 name = "partyline"
-version = "0.1.0"
+# Bumping this and pushing to main publishes release v<version> (.github/workflows/release.yml),
+# which installed copies then update to.
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +18,12 @@ ratatui = "0.30"
 rodio = { version = "0.23", default-features = false, features = ["playback"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Self-update from GitHub Releases; rustls so no OS TLS library is needed.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[profile.release]
+lto = "thin"
+strip = true
 
 [profile.dev]
 opt-level = 1

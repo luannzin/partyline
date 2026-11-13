@@ -115,7 +115,8 @@ pub enum Event {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClientMsg {
-    Hello { name: String, password: String },
+    /// `version` first, so any future layout change still reads it: host and guests must match.
+    Hello { version: String, name: String, password: String },
     Ready(bool),
     Spectate(bool),
     Rounds(u8),
