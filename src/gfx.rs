@@ -311,23 +311,77 @@ pub fn shift(buf: &mut Buffer, area: Rect, dx: i32, dy: i32) {
     }
 }
 
-// ---------- display font ----------
-// Bahnschrift Bold Condensed, distressed, baked by tools/bake.py. `scale` keeps the old 5x7
-// meaning: caps are 7 * scale pixels tall.
-
-fn font_k(scale: i32) -> f32 {
-    (7 * scale) as f32 / art::get().font.cap
+/// Caps with air between the letters, for small labels: "ROUND 2" -> "R O U N D   2".
+pub fn spaced(s: &str) -> String {
+    s.split(' ').map(|w| w.chars().map(String::from).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("   ")
 }
 
-pub fn big_width(s: &str, scale: i32) -> i32 {
-    let (f, k) = (&art::get().font, font_k(scale));
+/// One key hint: a bone keycap, then what it does. Returns the x after the label.
+pub fn keycap(buf: &mut Buffer, area: Rect, x: i32, y: i32, key: &str, label: &str) -> i32 {
+    let cap = format!(" {key} ");
+    text_bg(buf, area, x, y, &cap, pal::STAGE_DEEP, pal::INK.mul(0.78));
+    let x = x + cap.chars().count() as i32 + 1;
+    text(buf, area, x, y, label, pal::DIM);
+    x + label.chars().count() as i32
+}
+
+/// A row of key hints centered on `y`; trailing hints that don't fit are dropped.
+pub fn keys(buf: &mut Buffer, area: Rect, y: i32, hints: &[(&str, &str)]) {
+    let width = |h: &[(&str, &str)]| h.iter().map(|(k, l)| k.chars().count() as i32 + 3 + l.chars().count() as i32 + 3).sum::<i32>() - 3;
+    let mut n = hints.len();
+    while n > 1 && width(&hints[..n]) + 2 > area.width as i32 {
+        n -= 1;
+    }
+    let mut x = area.x as i32 + (area.width as i32 - width(&hints[..n])) / 2;
+    for (k, l) in &hints[..n] {
+        x = keycap(buf, area, x, y, k, l) + 3;
+    }
+}
+
+// ---------- display font ----------
+// Bahnschrift Bold Condensed, distressed, baked by tools/bake.py. Sized by cap height in
+// pixels; `scale` keeps the old 5x7 meaning: caps are 7 * scale pixels tall.
+
+fn font_k(cap: f32) -> f32 {
+    cap / art::get().font.cap
+}
+
+/// Width in pixels of display text with caps `cap` pixels tall.
+pub fn type_width(s: &str, cap: f32) -> i32 {
+    let (f, k) = (&art::get().font, font_k(cap));
     (s.chars().map(|c| f.glyph(c.to_ascii_uppercase()).1).sum::<f32>() * k).ceil() as i32
 }
 
+/// Cell rows that display text with caps `cap` pixels tall covers, drawn from an even pixel row.
+pub fn type_rows(cap: f32) -> i32 {
+    let f = &art::get().font;
+    ((f.pad + f.cap) * font_k(cap) / 2.0).ceil() as i32
+}
+
+pub fn big_width(s: &str, scale: i32) -> i32 {
+    type_width(s, (7 * scale) as f32)
+}
+
 impl Canvas {
+    /// Darken (or tint) rows `y0..y1` toward `c`, fading in from nothing at `y0` to `a` at `y1`:
+    /// a floor shadow for text to sit on.
+    pub fn band(&mut self, y0: i32, y1: i32, c: Rgb, a: f32) {
+        for y in y0..y1 {
+            let k = a * (y - y0 + 1) as f32 / (y1 - y0).max(1) as f32;
+            for x in 0..self.w {
+                self.blend(x, y, c, k);
+            }
+        }
+    }
+
     /// Draw display text; `fill(px, py)` colors each pixel in text-local coordinates.
     pub fn big(&mut self, x: i32, y: i32, s: &str, scale: i32, fill: &dyn Fn(i32, i32) -> Rgb) {
-        let (f, k) = (&art::get().font, font_k(scale));
+        self.type_at(x, y, s, (7 * scale) as f32, fill);
+    }
+
+    /// Display text with caps `cap` pixels tall (any size, fractional too).
+    pub fn type_at(&mut self, x: i32, y: i32, s: &str, cap: f32, fill: &dyn Fn(i32, i32) -> Rgb) {
+        let (f, k) = (&art::get().font, font_k(cap));
         let rows = (f.img.h as f32 * k).ceil() as i32;
         let mut pen = 0.0f32;
         for ch in s.chars() {
@@ -350,10 +404,15 @@ impl Canvas {
 
     /// Big text with a drop shadow, horizontally centered at `cx`.
     pub fn big_center(&mut self, cx: i32, y: i32, s: &str, scale: i32, fill: &dyn Fn(i32, i32) -> Rgb) {
-        let x = cx - big_width(s, scale) / 2;
-        let d = (scale / 3).max(1);
-        self.big(x + d, y + d, s, scale, &|_, _| pal::BLACK.lerp(pal::STAGE_DEEP, 0.4));
-        self.big(x, y, s, scale, fill);
+        self.type_center(cx, y, s, (7 * scale) as f32, fill);
+    }
+
+    /// Display text with a drop shadow, horizontally centered at `cx`.
+    pub fn type_center(&mut self, cx: i32, y: i32, s: &str, cap: f32, fill: &dyn Fn(i32, i32) -> Rgb) {
+        let x = cx - type_width(s, cap) / 2;
+        let d = ((cap / 21.0) as i32).max(1);
+        self.type_at(x + d, y + d, s, cap, &|_, _| pal::BLACK.lerp(pal::STAGE_DEEP, 0.4));
+        self.type_at(x, y, s, cap, fill);
     }
 }
 

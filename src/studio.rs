@@ -4,7 +4,7 @@ use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::art::{self, EMPTY_CHAIR};
 use crate::games::{self, Local, stage};
-use crate::gfx::{Canvas, Rgb, big_width, ctext, ease_out, hash, hue, pal, prog, text, text_bg};
+use crate::gfx::{Canvas, Rgb, big_width, ctext, ease_out, hash, hue, keycap, keys, pal, prog, spaced, text, text_bg};
 use crate::proto::{Kind, Link, Pid, Player, Session};
 
 /// Where the feet touch the floor in a contestant sprite, as a fraction of its height.
@@ -33,10 +33,6 @@ fn link_badge(p: &Player) -> (String, Rgb) {
         Link::Direct => (format!("NET {}ms", p.ping), pal::GREEN),
         Link::Relay => (format!("RELAY {}ms", p.ping), pal::ORANGE),
     }
-}
-
-fn short_code(code: &str) -> String {
-    if code.len() > 12 { format!("{}…{}", &code[..6], &code[code.len() - 4..]) } else { code.to_string() }
 }
 
 /// Contestant sprite `i` (player hue, or `EMPTY_CHAIR`) standing on `feet` at center `cx`,
@@ -96,10 +92,11 @@ pub fn lobby(buf: &mut Buffer, a: Rect, s: &Session, me: Pid, host: bool, t: f32
         let y = seat(&mut cv, p.hue as usize % 8, cx, feet - drop, h, 1.25);
         labels.push((cx, y, Some(*p)));
     }
+    // Floor shadow under the status and key rows.
+    cv.band((bottom - 2 - a.y as i32) * 2, cv.h, pal::BLACK, 0.6);
     cv.blit(buf, a);
 
-    let room = format!("{}  ·  INVITE CODE {}  ·  C copies it", s.room.to_uppercase(), short_code(&s.code));
-    ctext(buf, a, room_row, &room, pal::DIM);
+    ctext(buf, a, room_row, &spaced(&s.room.to_uppercase()), pal::INK.lerp(pal::DIM, 0.35));
     let w = slot as usize;
     let at = |cx: f32, s: &str| a.x as i32 + cx as i32 - s.chars().count() as i32 / 2;
     for (cx, y, p) in labels {
@@ -107,18 +104,19 @@ pub fn lobby(buf: &mut Buffer, a: Rect, s: &Session, me: Pid, host: bool, t: f32
         match p {
             None => text(buf, a, at(cx, "OPEN"), row + 2, "OPEN", pal::DIM),
             Some(p) => {
-                let name: String = p.name.to_uppercase().chars().take(w.saturating_sub(2).max(4)).collect();
-                if p.id == me {
-                    let pill = format!(" {name} ");
-                    text_bg(buf, a, at(cx, &pill), row, &pill, pal::STAGE_DEEP, hue(p.hue));
-                } else {
-                    text(buf, a, at(cx, &name), row, &name, pal::INK);
-                }
+                // Nameplates: your own lit in your color, everyone else's name in theirs.
+                let name: String = p.name.to_uppercase().chars().take(w.saturating_sub(4).max(4)).collect();
+                let plate = format!(" {name} ");
+                let (fg, bg) = if p.id == me { (pal::STAGE_DEEP, hue(p.hue)) } else { (hue(p.hue), pal::PANEL) };
+                text_bg(buf, a, at(cx, &plate), row, &plate, fg, bg);
                 let (badge, bc) = link_badge(p);
                 let badge: String = badge.chars().take(w.saturating_sub(1).max(4)).collect();
                 text(buf, a, at(cx, &badge), feet_row + 1, &badge, bc);
-                let st = if p.ready { "READY" } else { "not ready" };
-                text(buf, a, at(cx, st), feet_row + 2, st, if p.ready { pal::GREEN } else { pal::DIM });
+                if p.ready {
+                    text_bg(buf, a, at(cx, " READY "), feet_row + 2, " READY ", pal::STAGE_DEEP, pal::GREEN);
+                } else {
+                    text(buf, a, at(cx, "not ready"), feet_row + 2, "not ready", pal::DIM);
+                }
             }
         }
     }
@@ -128,14 +126,17 @@ pub fn lobby(buf: &mut Buffer, a: Rect, s: &Session, me: Pid, host: bool, t: f32
     if !audience.is_empty() {
         ctext(buf, a, bottom - 1, &format!("WATCHING  {}", audience.join(" · ")), pal::DIM);
     }
-    let status = format!("{ready}/{} READY   ·   {} ROUNDS", players.len(), s.rounds);
+    let mut status = format!("{ready}/{} READY   ·   {} ROUNDS", players.len(), s.rounds);
+    if !host {
+        status.push_str("   ·   THE HOST STARTS THE SHOW");
+    }
     ctext(buf, a, bottom, &status, pal::GOLD);
-    let keys = if host {
-        "SPACE ready   S sit out   ←→ rounds   ENTER start   ESC leave"
+    let hints: &[(&str, &str)] = if host {
+        &[("ENTER", "start"), ("SPACE", "ready"), ("←→", "rounds"), ("C", "copy invite"), ("S", "sit out"), ("ESC", "leave")]
     } else {
-        "SPACE ready   S sit out   ESC leave   ·   the host starts it"
+        &[("SPACE", "ready"), ("C", "copy invite"), ("S", "sit out"), ("ESC", "leave")]
     };
-    ctext(buf, a, bottom + 1, keys, pal::DIM);
+    keys(buf, a, bottom + 1, hints);
 }
 
 /// Round title card, then a 3-2-1 countdown that breaks the grid.
@@ -167,7 +168,7 @@ pub fn intro(buf: &mut Buffer, a: Rect, s: &Session, kind: Kind, go_at: u64, now
     cv.blit(buf, a);
     let (line, keys) = games::howto(kind);
     let row = a.y as i32 + (ty + th) / 2 + 2;
-    ctext(buf, a, a.y as i32 + ty / 2 - 2, &format!("ROUND {} OF {}", s.round + 1, s.rounds), pal::GOLD);
+    ctext(buf, a, a.y as i32 + ty / 2 - 2, &spaced(&format!("ROUND {} OF {}", s.round + 1, s.rounds)), pal::GOLD);
     if !counting {
         ctext(buf, a, row, line, pal::INK);
         let pill = format!("  {keys}  ");
@@ -224,7 +225,7 @@ pub fn results(buf: &mut Buffer, a: Rect, s: &Session, kind: Kind, gains: &[(Pid
     let leftf = (until.saturating_sub(now) as f32 / 5600.0).min(1.0);
     let next = if s.round + 1 < s.rounds { "NEXT ROUND" } else { "THE FINAL SCORES" };
     let bar = ((a.width as f32 - 20.0) * leftf) as usize;
-    ctext(buf, a, a.bottom() as i32 - 4, &format!("{} · {}", games::title(kind), next), pal::DIM);
+    ctext(buf, a, a.bottom() as i32 - 4, &spaced(&format!("{} · {}", games::title(kind), next)), pal::DIM);
     ctext(buf, a, a.bottom() as i32 - 3, &"━".repeat(bar), pal::GOLD);
 }
 
@@ -289,9 +290,10 @@ pub fn finale(buf: &mut Buffer, a: Rect, s: &Session, host: bool, t: f32, since:
     let dt = (t - l.pt).clamp(0.0, 0.1);
     l.pt = t;
     l.draw_parts(&mut cv, dt, 12.0);
+    cv.band(floor + 1, cv.h, pal::BLACK, 0.55);
     cv.blit(buf, a);
 
-    ctext(buf, a, a.y as i32 + 2, "TONIGHT'S CHAMPION", pal::GOLD);
+    ctext(buf, a, a.y as i32 + 2, &spaced("TONIGHT'S CHAMPION"), pal::GOLD);
     for (x, row, n, score) in names {
         let label = format!("{n} {score}");
         text(buf, a, a.x as i32 + x + (bw - label.len() as i32) / 2, a.y as i32 + row, &label, pal::INK);
@@ -300,8 +302,12 @@ pub fn finale(buf: &mut Buffer, a: Rect, s: &Session, host: bool, t: f32, since:
     if !rest.is_empty() {
         ctext(buf, a, a.bottom() as i32 - 3, &rest.join("   "), pal::DIM);
     }
-    let keys = if host { "ENTER back to the lobby   ESC leave" } else { "the host will bring you back   ESC leave" };
-    ctext(buf, a, a.bottom() as i32 - 2, keys, pal::DIM);
+    if host {
+        keys(buf, a, a.bottom() as i32 - 2, &[("ENTER", "back to the lobby"), ("ESC", "leave")]);
+    } else {
+        keys(buf, a, a.bottom() as i32 - 2, &[("ESC", "leave")]);
+        ctext(buf, a, a.bottom() as i32 - 1, "the host will bring everyone back", pal::DIM);
+    }
 }
 
 /// One-row header during play: round, game, live score chips.
@@ -334,7 +340,7 @@ pub fn lower_third(buf: &mut Buffer, a: Rect, name: &str, c: Rgb, t: f32) {
     let label = format!(" CAM · {name} ");
     text_bg(buf, a, a.x as i32 + 3, y, " ● REC ", pal::INK, live.mul(0.8));
     text_bg(buf, a, a.x as i32 + 10, y, &label, pal::STAGE_DEEP, c);
-    text(buf, a, a.x as i32 + 11 + label.len() as i32, y, "TAB switch camera", pal::DIM);
+    keycap(buf, a, a.x as i32 + 12 + label.chars().count() as i32, y, "TAB", "switch camera");
 }
 
 /// Giant GO! that breaks the grid for half a second.

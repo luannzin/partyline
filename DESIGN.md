@@ -54,8 +54,14 @@ in. An eliminated player's hue drains toward grey (`Rgb::grey`).
 ## Type
 
 - Display: Bahnschrift Bold Condensed, distressed, area-sampled from a 56 px cap atlas to any
-  size (`Canvas::big`, caps are `7 * scale` pixels). Bone-to-amber gradient with a moving shimmer.
-- Body: the terminal's own font, sentence case for guidance, caps for labels.
+  size (`Canvas::type_at` by cap height in pixels; `Canvas::big` is `7 * scale`). Bone-to-amber
+  gradient; the logo adds a moving shimmer.
+- TV menu: a channel wheel. The highlighted channel is set in the display font on the glass
+  (6 to 12 px caps, one size per page, chosen to fit the tube), its neighbours dim above and
+  below in the terminal font, its value in an input plate under it. `CH 01` in TV green.
+- Body: the terminal's own font, sentence case for guidance. Small headings are spaced caps
+  (`gfx::spaced`). Key hints are bone keycaps followed by a dim verb (`gfx::keys`).
+- Lobby nameplates: your own lit in your hue, the others' names in their hue on a dark plate.
 
 ## Motion
 
@@ -67,7 +73,8 @@ Custom curves only (`gfx::ease_out` = cubic-bezier(0.23, 1, 0.32, 1),
 | Select in the TV menu | camera dollies into the glass, 700 ms ease-in-out |
 | Inside appears | CRT power-on line opens, 260 ms ease-out |
 | Leave | CRT collapses to a line then a dot (320 ms), camera pulls back (550 ms) |
-| Menu cursor | instant, the TV light in the room shifts color |
+| Menu cursor | the channel rolls in from the side it came from (4 px, 200 ms ease-out) and brightens; `CH` flares; the TV light in the room shifts color |
+| Tuning in / no signal | snow on the glass, the headline breathes |
 | Page change | 140 ms channel static |
 | Contestants | drop into their chairs, 400 ms ease-out, 60 ms stagger |
 | Title cards | typewriter, 35 ms per letter |

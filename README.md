@@ -47,7 +47,7 @@ cargo run --release -- --bots 3
 
 - **Same network:** host a room; it appears in everyone's JOIN A ROOM list on its own.
 - **Anywhere else:** in the lobby press `C` to copy the invite code and send it. Friends pick
-  JOIN A ROOM, then ENTER AN INVITE CODE, and paste it.
+  JOIN A ROOM, then INVITE CODE, and paste it.
 - A password on the room works like a Radmin network password.
 - The lobby shows how each player is connected: `LAN`, `NET` (direct over the internet)
   or `RELAY` (when no direct path exists, traffic goes through an encrypted relay).

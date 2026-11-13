@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::games::{Fx, Game, Local, View, derby};
-use crate::gfx::{self, Rgb, big_width, ctext, ease_in_out, hash, hue, pal, prog, text, text_bg};
+use crate::gfx::{self, Rgb, big_width, ctext, ease_in_out, ease_out, hash, hue, keys, pal, prog, spaced, text, text_bg, type_rows, type_width};
 use crate::net::{self, Conn, Lan, Net, RoomAd};
 use crate::proto::{ClientMsg, Dir, Event, Input, Kind, Phase, Pid, ServerMsg, Session};
 use crate::room;
@@ -39,8 +39,30 @@ enum Page {
     Join,
     Code,
     Password,
-    Connecting(String),
+    /// Headline, then what it is connecting to.
+    Connecting(String, String),
     Error(String),
+}
+
+/// The line under the highlighted channel.
+enum Sub {
+    Note(String),
+    /// A value in an input plate; `true` when it is a placeholder.
+    Field(String, bool),
+}
+
+/// Where the TV menu's parts sit, in rows from the top of the glass.
+struct Tv {
+    /// Logo scale; 0 = a small spaced title instead.
+    logo: i32,
+    /// Cap height of the highlighted channel in pixels; 0 = no room, it becomes a pill.
+    cap: f32,
+    /// Neighbouring channels shown above and below.
+    wheel: bool,
+    prev: i32,
+    big: i32,
+    sub: i32,
+    next: i32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -100,6 +122,9 @@ pub struct App {
     // TV menu
     page: Page,
     sel: usize,
+    /// When the highlight last moved, and which way (-1 up, 1 down): the channel rolls in.
+    sel_t: f32,
+    sel_dir: i32,
     edit: Option<(Field, String)>,
     chan_t: f32,
     room: String,
@@ -107,7 +132,7 @@ pub struct App {
     bots: u8,
     code: String,
     join_pw: String,
-    target: Option<EndpointId>,
+    target: Option<(EndpointId, String)>,
     lan: Vec<RoomAd>,
     lan_rx: Option<mpsc::UnboundedReceiver<Lan>>,
     net: Option<Net>,
@@ -155,6 +180,8 @@ impl App {
             area: Rect::default(),
             page: Page::Main,
             sel: 0,
+            sel_t: -1.0,
+            sel_dir: 0,
             edit: None,
             chan_t: -1.0,
             password: String::new(),
@@ -248,6 +275,8 @@ impl App {
                 }
             }
         }
+        // A room that went away can take the highlighted channel with it.
+        self.sel = self.sel.min(self.items().len().saturating_sub(1));
         if let Some(rx) = &mut self.pending {
             match rx.try_recv() {
                 Ok(Ok((conn, hosting))) => {
@@ -420,50 +449,96 @@ impl App {
     fn goto(&mut self, p: Page) {
         self.page = p;
         self.sel = 0;
+        self.sel_t = self.t();
+        self.sel_dir = 0;
         self.edit = None;
         self.chan_t = self.t();
         self.sfx.play(Sound::Static);
     }
 
+    /// The channels on the current page. Labels are short: the highlighted one is set in the
+    /// display font on the glass.
     fn items(&self) -> Vec<(String, Item)> {
-        let dots = |s: &str| if s.is_empty() { "none".to_string() } else { "•".repeat(s.chars().count()) };
+        let s = |l: &str, it: Item| (l.to_string(), it);
         match &self.page {
-            Page::Main => vec![
-                ("HOST A ROOM".into(), Item::Host),
-                ("JOIN A ROOM".into(), Item::Join),
-                (format!("NAME  {}", self.name.to_uppercase()), Item::Name),
-                ("QUIT".into(), Item::Quit),
-            ],
+            Page::Main => vec![s("HOST A ROOM", Item::Host), s("JOIN A ROOM", Item::Join), s("NAME", Item::Name), s("QUIT", Item::Quit)],
             Page::Host => vec![
-                (format!("ROOM  {}", self.room.to_uppercase()), Item::RoomName),
-                (format!("PASSWORD  {}", dots(&self.password)), Item::Password),
-                (format!("BOTS  ‹ {} ›", self.bots), Item::Bots),
-                ("OPEN THE ROOM".into(), Item::Open),
-                ("BACK".into(), Item::BackMain),
+                s("ROOM NAME", Item::RoomName),
+                s("PASSWORD", Item::Password),
+                s("BOTS", Item::Bots),
+                s("GO LIVE", Item::Open),
+                s("BACK", Item::BackMain),
             ],
             Page::Join => {
-                let mut v: Vec<(String, Item)> = self
-                    .lan
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (format!("{}{}", r.name.to_uppercase(), if r.locked { "  [locked]" } else { "" }), Item::Room(i)))
-                    .collect();
-                v.push(("ENTER AN INVITE CODE".into(), Item::Code));
-                v.push(("BACK".into(), Item::BackMain));
+                let mut v: Vec<(String, Item)> = self.lan.iter().enumerate().map(|(i, r)| (r.name.to_uppercase(), Item::Room(i))).collect();
+                v.push(s("INVITE CODE", Item::Code));
+                v.push(s("BACK", Item::BackMain));
                 v
             }
-            Page::Code => vec![
-                (format!("CODE  {}", if self.code.is_empty() { "paste it here".into() } else { short(&self.code) }), Item::Code),
-                ("TUNE IN".into(), Item::CodeGo),
-                ("BACK".into(), Item::BackJoin),
-            ],
-            Page::Password => vec![
-                (format!("PASSWORD  {}", dots(&self.join_pw)), Item::JoinPw),
-                ("TUNE IN".into(), Item::PwGo),
-                ("BACK".into(), Item::BackJoin),
-            ],
-            Page::Connecting(_) => vec![],
-            Page::Error(_) => vec![("OK".into(), Item::Ok)],
+            Page::Code => vec![s("CODE", Item::Code), s("TUNE IN", Item::CodeGo), s("BACK", Item::BackJoin)],
+            Page::Password => vec![s("PASSWORD", Item::JoinPw), s("TUNE IN", Item::PwGo), s("BACK", Item::BackJoin)],
+            Page::Connecting(..) => vec![],
+            Page::Error(_) => vec![s("OK", Item::Ok)],
+        }
+    }
+
+    /// What the highlighted channel does, or the value it holds.
+    fn sub(&self, it: Item) -> Sub {
+        let note = |s: &str| Sub::Note(s.into());
+        let secret = |s: &str, none: &str| {
+            if s.is_empty() { Sub::Field(none.into(), true) } else { Sub::Field("•".repeat(s.chars().count()), false) }
+        };
+        match it {
+            Item::Host => note("open a room for your friends"),
+            Item::Join => note("find one on your network, or use a code"),
+            Item::Name => Sub::Field(self.name.to_uppercase(), false),
+            Item::Quit => note("switch the TV off"),
+            Item::RoomName => Sub::Field(self.room.to_uppercase(), false),
+            Item::Password => secret(&self.password, "none · anyone can join"),
+            Item::Bots => Sub::Field(format!("‹   {}   ›", self.bots), false),
+            Item::Open => note("open the room and wait for players"),
+            Item::Room(i) => note(if self.lan.get(i).is_some_and(|r| r.locked) { "locked · needs the password" } else { "open · anyone can join" }),
+            Item::Code if self.page == Page::Join => note("for rooms outside your network"),
+            Item::Code if self.code.is_empty() => Sub::Field("paste it here".into(), true),
+            Item::Code => Sub::Field(short(&self.code), false),
+            Item::JoinPw => secret(&self.join_pw, "type the password"),
+            Item::CodeGo | Item::PwGo => note("connect to the room"),
+            Item::BackMain | Item::BackJoin | Item::Ok => note(""),
+        }
+    }
+
+    /// The big line on the glass: the highlighted channel, or the page's own headline.
+    fn headline(&self) -> String {
+        match &self.page {
+            Page::Connecting(head, _) => head.clone(),
+            Page::Error(_) => "NO SIGNAL".into(),
+            _ => self.items().get(self.sel).map(|i| i.0.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// Pages that wear the PARTYLINE logo; the rest get a small title.
+    fn branded(&self) -> bool {
+        matches!(self.page, Page::Main | Page::Connecting(..) | Page::Error(_))
+    }
+
+    fn page_title(&self) -> &'static str {
+        match self.page {
+            Page::Host => "HOST A ROOM",
+            Page::Join => "JOIN A ROOM",
+            Page::Code => "JOIN BY CODE",
+            Page::Password => "LOCKED ROOM",
+            _ => "PARTYLINE",
+        }
+    }
+
+    /// A line under the small title.
+    fn status(&self, t: f32) -> Option<String> {
+        match &self.page {
+            Page::Join if self.lan.is_empty() => Some(format!("scanning your network{}", ".".repeat((t * 2.0) as usize % 3 + 1))),
+            Page::Join if self.lan.len() == 1 => Some("1 room on your network".into()),
+            Page::Join => Some(format!("{} rooms on your network", self.lan.len())),
+            Page::Password => self.target.as_ref().map(|r| r.1.to_uppercase()),
+            _ => None,
         }
     }
 
@@ -482,7 +557,7 @@ impl App {
             Item::BackJoin => self.goto(Page::Join),
             Item::Room(i) => {
                 let Some(r) = self.lan.get(i).cloned() else { return };
-                self.target = Some(r.id);
+                self.target = Some((r.id, r.name.clone()));
                 if r.locked {
                     self.goto(Page::Password);
                     self.edit = Some((Field::JoinPw, String::new()));
@@ -496,13 +571,13 @@ impl App {
             }
             Item::Code => self.edit = Some((Field::Code, self.code.clone())),
             Item::CodeGo => match self.code.trim().parse::<EndpointId>() {
-                Ok(id) => self.join(id, self.join_pw.clone(), "THE ROOM".into()),
+                Ok(id) => self.join(id, self.join_pw.clone(), "BY INVITE CODE".into()),
                 Err(_) => self.goto(Page::Error("That invite code doesn't look right. Copy it again from the host's lobby.".into())),
             },
             Item::JoinPw => self.edit = Some((Field::JoinPw, self.join_pw.clone())),
             Item::PwGo => {
-                if let Some(id) = self.target {
-                    self.join(id, self.join_pw.clone(), "THE ROOM".into());
+                if let Some((id, name)) = self.target.clone() {
+                    self.join(id, self.join_pw.clone(), name);
                 }
             }
             Item::Ok => self.goto(Page::Main),
@@ -533,7 +608,7 @@ impl App {
             let _ = tx.send(r);
         });
         self.pending = Some(rx);
-        self.goto(Page::Connecting("OPENING THE STUDIO".into()));
+        self.goto(Page::Connecting("GOING LIVE".into(), self.room.to_uppercase()));
     }
 
     fn join(&mut self, id: EndpointId, pw: String, label: String) {
@@ -549,7 +624,7 @@ impl App {
             let _ = tx.send(r);
         });
         self.pending = Some(rx);
-        self.goto(Page::Connecting(format!("TUNING IN TO {}", label.to_uppercase())));
+        self.goto(Page::Connecting("TUNING IN".into(), label.to_uppercase()));
     }
 
     fn shutdown_hosting(&mut self) {
@@ -630,10 +705,12 @@ impl App {
         match k.code {
             KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
                 self.sel = (self.sel + n - 1) % n;
+                (self.sel_t, self.sel_dir) = (self.t(), -1);
                 self.sfx.play(Sound::Tick);
             }
             KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') | KeyCode::Tab => {
                 self.sel = (self.sel + 1) % n;
+                (self.sel_t, self.sel_dir) = (self.t(), 1);
                 self.sfx.play(Sound::Tick);
             }
             KeyCode::Left | KeyCode::Right if items.get(self.sel).map(|i| i.1) == Some(Item::Bots) => {
@@ -648,7 +725,7 @@ impl App {
             KeyCode::Esc => match self.page {
                 Page::Main => {}
                 Page::Code | Page::Password => self.goto(Page::Join),
-                Page::Connecting(_) => {
+                Page::Connecting(..) => {
                     self.pending = None;
                     self.shutdown_hosting();
                     self.goto(Page::Main);
@@ -790,29 +867,98 @@ impl App {
     }
 
     /// The room, `p` of the way along the dolly into the TV; `menu` draws the TV menu on the glass.
-    fn draw_room(&mut self, buf: &mut Buffer, a: Rect, p: f32, menu: bool) {
+    fn draw_room(&self, buf: &mut Buffer, a: Rect, p: f32, menu: bool) {
         let t = self.t();
         let mut shot = room::draw(a, p, t, self.glow);
         let sr = shot.screen(a);
-        // Logo rows on the glass: 0 = none, else the display-font scale.
-        let logo = if !menu || sr.width < 24 || sr.height < 10 { 0 } else if sr.height >= 20 && sr.width >= 44 { 2 } else { 1 };
-        if logo > 0 {
-            let (ox, oy) = ((sr.x - a.x) as i32, (sr.y - a.y) as i32 * 2);
-            let w = big_width("PARTYLINE", logo);
-            shot.cv.big_center(ox + sr.width as i32 / 2, oy + 4, "PARTYLINE", logo, &|x, y| {
-                let sweep = ((t * 0.4).fract() * (w + 30) as f32) as i32 - 15;
-                let c = pal::INK.lerp(pal::GOLD, y as f32 / (7 * logo) as f32);
-                if (x + y / 2 - sweep).abs() < 2 { c.lerp(pal::INK, 0.7) } else { c }
-            });
+        let tv = (menu && sr.width > 10 && sr.height > 6).then(|| self.tv(sr, t));
+        if let Some(l) = &tv {
+            self.menu_pixels(&mut shot.cv, a, sr, l, t);
         }
         shot.cv.blit(buf, a);
-        if menu && sr.width > 10 && sr.height > 6 {
-            self.draw_menu(buf, sr, t, if logo > 0 { (4 + 7 * logo) / 2 + 1 } else { 0 });
+        if let Some(l) = &tv {
+            self.menu_cells(buf, sr, l, t);
         }
     }
 
-    /// The TV menu inside the glass rect `sr`; `logo_rows` are already taken by the logo.
-    fn draw_menu(&mut self, buf: &mut Buffer, sr: Rect, t: f32, logo_rows: i32) {
+    /// Lay the menu out on the glass `sr`: logo (or a small title), then a channel wheel: the
+    /// previous channel, the highlighted one big in the display font with its line under it,
+    /// the next channel; key hints on the last row. Everything shrinks to fit the tube.
+    fn tv(&self, sr: Rect, t: f32) -> Tv {
+        let (w, foot) = (sr.width as i32, sr.height as i32 - 1);
+        let wheel = self.items().len() > 1;
+        let subs = match &self.page {
+            Page::Error(m) => wrap(m, (w - 6).max(8) as usize).len() as i32,
+            _ => 1,
+        };
+        let fixed = subs + if wheel { 2 } else { 0 };
+        let small = if self.status(t).is_some() { 3 } else { 2 };
+        // The logo sits 4 pixels down; a 4-row headline must still fit under it.
+        let (logo, top) = [2, 1]
+            .into_iter()
+            .filter(|_| self.branded())
+            .map(|l| (l, (5 + 8 * l) / 2 + 1))
+            .find(|&(l, top)| big_width("PARTYLINE", l) <= w - 4 && foot - top >= fixed + 4)
+            .unwrap_or((0, small));
+        // One size for every channel on the page, so the label doesn't jump while flipping; a
+        // label too long for any size gets its own.
+        let avail = foot - top - fixed;
+        let head = vec![self.headline()];
+        let labels = if wheel { self.items().into_iter().map(|i| i.0).collect() } else { head.clone() };
+        let fits = |c: f32, ls: &[String]| type_rows(c) <= avail && ls.iter().all(|s| type_width(s, c) <= w - 4);
+        let sizes = [12.0, 10.0, 9.0, 8.0, 7.0, 6.0];
+        let cap = sizes.into_iter().find(|&c| fits(c, &labels)).or_else(|| sizes.into_iter().find(|&c| fits(c, &head))).unwrap_or(0.0);
+        let rows = if cap > 0.0 { type_rows(cap) } else { 1 };
+        let g = ((avail - rows) / if wheel { 3 } else { 2 }).clamp(0, 1);
+        let used = rows + fixed + if wheel { 2 * g } else { g };
+        let prev = top + ((foot - top - used) / 2).max(0);
+        let big = if wheel { prev + 1 + g } else { prev };
+        let sub = big + rows + if wheel { 0 } else { g };
+        Tv { logo, cap, wheel, prev, big, sub, next: sub + subs + g }
+    }
+
+    /// The menu's pixel layer: logo, the highlighted channel in the display font, and snow
+    /// while there is no signal.
+    fn menu_pixels(&self, cv: &mut gfx::Canvas, a: Rect, sr: Rect, l: &Tv, t: f32) {
+        if t - self.chan_t < 0.14 {
+            return;
+        }
+        let (gx, gy, gw, gh) = ((sr.x - a.x) as i32, (sr.y - a.y) as i32 * 2, sr.width as i32, sr.height as i32 * 2);
+        let cx = gx + gw / 2;
+        let (connecting, error) = (matches!(self.page, Page::Connecting(..)), matches!(self.page, Page::Error(_)));
+        if connecting || error {
+            let seed = (t * 30.0) as u32;
+            for y in gy..gy + gh {
+                for x in gx..gx + gw {
+                    let (nx, ny) = ((x - gx) as f32 / gw as f32 * 2.0 - 1.0, (y - gy) as f32 / gh as f32 * 2.0 - 1.0);
+                    let fade = 1.0 - (nx.abs().powi(6) + ny.abs().powi(6)).min(1.0);
+                    let g = (hash(seed ^ (x as u32).wrapping_mul(31), y as u32) % 100) as f32 / 100.0;
+                    cv.blend(x, y, Rgb(g, g, g), if error { 0.16 } else { 0.1 } * fade);
+                }
+            }
+        }
+        if l.logo > 0 {
+            let (s, w) = (l.logo, big_width("PARTYLINE", l.logo));
+            cv.big_center(cx, gy + 4, "PARTYLINE", s, &|x, y| {
+                let sweep = ((t * 0.4).fract() * (w + 30) as f32) as i32 - 15;
+                let c = pal::INK.lerp(pal::GOLD, y as f32 / (7 * s) as f32);
+                if (x + y / 2 - sweep).abs() < 2 { c.lerp(pal::INK, 0.7) } else { c }
+            });
+        }
+        if l.cap > 0.0 {
+            let cap = l.cap;
+            let k = ease_out(prog(t, self.sel_t, 0.2));
+            let by = gy + 2 * l.big + ((1.0 - k) * 4.0).round() as i32 * self.sel_dir;
+            let (c0, c1) = if error { (pal::ORANGE, pal::RED) } else { (pal::INK, pal::GOLD) };
+            let lit = if connecting { 0.8 + 0.2 * (t * 5.0).sin() } else { 0.4 + 0.6 * k };
+            cv.light(cx as f32, by as f32 + cap * 0.5, gw as f32 * 0.4, self.glow, 0.1);
+            cv.type_center(cx, by, &self.headline(), cap, &|_, y| c0.lerp(c1, y as f32 / cap).mul(lit));
+        }
+    }
+
+    /// The menu's text layer, over the pixels: on-screen display, title, the wheel's neighbours,
+    /// the line under the highlighted channel, key hints.
+    fn menu_cells(&self, buf: &mut Buffer, sr: Rect, l: &Tv, t: f32) {
         // Channel-change static.
         if t - self.chan_t < 0.14 {
             let seed = (t * 120.0) as u32;
@@ -828,73 +974,95 @@ impl App {
             }
             return;
         }
-        let top = sr.y as i32;
-        text(buf, sr, sr.x as i32 + 3, top, "CH 03", pal::DIM);
+        let row = |r: i32| sr.y as i32 + r;
+        let foot = row(sr.height as i32 - 1);
+        let items = self.items();
+        let n = items.len();
+        // On-screen display: the channel number in TV green (it flares when it changes) and
+        // the tape light.
+        if l.wheel {
+            let pop = 1.0 - prog(t, self.sel_t, 0.45);
+            text(buf, sr, sr.x as i32 + 3, row(0), &format!("CH {:02}", self.sel + 1), pal::GREEN.lerp(pal::INK, pop));
+        }
         let live = if (t * 1.4).fract() < 0.6 { pal::RED } else { pal::PODIUM_DARK };
-        text(buf, sr, sr.right() as i32 - 9, top, "● REC", live);
-        let mut y = top + 1;
-        if logo_rows > 0 {
-            y = top + logo_rows;
-        } else {
-            ctext(buf, sr, y + 1, "P A R T Y L I N E", pal::INK);
-            y += 3;
+        text(buf, sr, sr.right() as i32 - 9, row(0), "● REC", live);
+        if l.logo == 0 {
+            ctext(buf, sr, row(1), &fit_spaced(self.page_title(), sr.width), pal::GOLD);
+        }
+        if let Some(s) = self.status(t) {
+            ctext(buf, sr, row(2), &s, pal::DIM);
+        }
+
+        // The wheel: neighbours, dim, above and below the highlighted channel.
+        if l.wheel {
+            let dim = pal::DIM.mul(0.8);
+            if n > 2 {
+                ctext(buf, sr, row(l.prev), &items[(self.sel + n - 1) % n].0, dim);
+            }
+            ctext(buf, sr, row(l.next), &items[(self.sel + 1) % n].0, dim);
+        }
+        if l.cap == 0.0 {
+            let pill = format!("  {}  ", self.headline());
+            let x = sr.x as i32 + (sr.width as i32 - pill.chars().count() as i32) / 2;
+            text_bg(buf, sr, x, row(l.big), &pill, pal::STAGE_DEEP, pal::GOLD);
         }
         match &self.page {
-            Page::Connecting(msg) => {
-                let dots = ".".repeat(((t * 3.0) as usize % 3) + 1);
-                ctext(buf, sr, y + 2, &format!("{msg}{dots}"), pal::INK);
-                ctext(buf, sr, y + 4, "ESC cancels", pal::DIM);
-                return;
-            }
-            Page::Error(msg) => {
-                for (i, line) in wrap(msg, sr.width as usize - 6).iter().enumerate() {
-                    ctext(buf, sr, y + 1 + i as i32, line, pal::INK);
+            Page::Error(m) => {
+                for (i, line) in wrap(m, (sr.width as i32 - 6).max(8) as usize).iter().enumerate() {
+                    ctext(buf, sr, row(l.sub) + i as i32, line, pal::INK);
                 }
-                y += wrap(msg, sr.width as usize - 6).len() as i32 + 2;
             }
-            Page::Join if self.lan.is_empty() => {
-                let dots = ".".repeat(((t * 2.0) as usize % 3) + 1);
-                ctext(buf, sr, y, &format!("Looking for rooms on your network{dots}"), pal::DIM);
-                y += 2;
-            }
-            _ => {}
-        }
-        let items = self.items();
-        let avail = (sr.bottom() as i32 - 2 - y).max(1) as usize;
-        let first = self.sel.saturating_sub(avail.saturating_sub(1));
-        for (i, (label, _)) in items.iter().enumerate().skip(first).take(avail) {
-            let selected = i == self.sel;
-            let editing = selected && self.edit.is_some();
-            let label = match (&self.edit, editing) {
-                (Some((f, buf_)), true) => {
-                    let shown = if matches!(f, Field::Password | Field::JoinPw) { "•".repeat(buf_.chars().count()) } else { buf_.to_uppercase() };
-                    let caret = if (t * 2.0).fract() < 0.5 { "▏" } else { " " };
-                    let head = label.split("  ").next().unwrap_or("");
-                    format!("{head}  {}{caret}", tail(&shown, sr.width as usize - head.len() - 10))
+            Page::Connecting(_, what) => ctext(buf, sr, row(l.sub), &fit_spaced(what, sr.width), pal::DIM),
+            _ => {
+                if let Some(&(_, it)) = items.get(self.sel) {
+                    self.draw_sub(buf, sr, row(l.sub), it, t);
                 }
-                _ => label.clone(),
-            };
-            if selected {
-                let pill = format!("  {label}  ");
-                let x = sr.x as i32 + (sr.width as i32 - pill.chars().count() as i32) / 2;
-                text_bg(buf, sr, x, y, &pill, pal::STAGE_DEEP, if editing { pal::INK } else { pal::GOLD });
-            } else {
-                ctext(buf, sr, y, &label, pal::INK.lerp(pal::DIM, 0.4));
             }
-            y += 1;
         }
-        let (hint, c) = if self.edit.is_some() {
-            ("type · ENTER save · ESC cancel".to_string(), pal::DIM)
+
+        // Key hints, unless there is news for the footer.
+        if self.edit.is_some() {
+            keys(buf, sr, foot, &[("ENTER", "save"), ("ESC", "cancel")]);
+        } else if let Page::Connecting(..) = self.page {
+            keys(buf, sr, foot, &[("ESC", "cancel")]);
+        } else if let Page::Error(_) = self.page {
+            keys(buf, sr, foot, &[("ENTER", "ok")]);
         } else if let Some(tag) = &self.updated {
-            (format!("{tag} installed · restart to play it"), pal::GOLD)
+            ctext(buf, sr, foot, &format!("{tag} installed · restart to play it"), pal::GOLD);
         } else if let Some(e) = &self.net_err {
-            (format!("offline: {}", e.chars().take(sr.width as usize - 12).collect::<String>()), pal::DIM)
+            ctext(buf, sr, foot, &format!("offline: {}", e.chars().take(sr.width as usize - 12).collect::<String>()), pal::DIM);
         } else if self.net.is_none() {
-            ("warming up the network…".to_string(), pal::DIM)
+            ctext(buf, sr, foot, "warming up the network…", pal::DIM);
         } else {
-            ("↑↓ choose · ENTER select".to_string(), pal::DIM)
+            let mut k = vec![];
+            if items.get(self.sel).map(|i| i.1) == Some(Item::Bots) {
+                k.push(("←→", "bots"));
+            }
+            k.extend([("↑↓", "channel"), ("ENTER", "select")]);
+            if self.page != Page::Main {
+                k.push(("ESC", "back"));
+            }
+            keys(buf, sr, foot, &k);
+        }
+    }
+
+    /// The line under the highlighted channel: a note, or its value in an input plate (bone
+    /// with a caret while typing).
+    fn draw_sub(&self, buf: &mut Buffer, sr: Rect, y: i32, it: Item, t: f32) {
+        let (content, fg, bg) = match (self.sub(it), &self.edit) {
+            (Sub::Note(s), _) => return ctext(buf, sr, y, &s, pal::DIM),
+            (Sub::Field(..), Some((f, typed))) => {
+                let shown = if matches!(f, Field::Password | Field::JoinPw) { "•".repeat(typed.chars().count()) } else { typed.to_uppercase() };
+                let caret = if (t * 2.0).fract() < 0.5 { "▏" } else { " " };
+                (format!("{}{caret}", tail(&shown, (sr.width as usize).saturating_sub(10))), pal::STAGE_DEEP, pal::INK)
+            }
+            (Sub::Field(v, placeholder), None) => (v, if placeholder { pal::DIM } else { pal::INK }, pal::PANEL.lerp(pal::INK, 0.1)),
         };
-        ctext(buf, sr, sr.bottom() as i32 - 1, &hint, c);
+        let n = content.chars().count() as i32;
+        let w = (n + 4).max(16).min(sr.width as i32 - 4);
+        let x = sr.x as i32 + (sr.width as i32 - w) / 2;
+        text_bg(buf, sr, x, y, &" ".repeat(w.max(0) as usize), fg, bg);
+        text_bg(buf, sr, x + (w - n) / 2, y, &content, fg, bg);
     }
 
     fn draw_studio(&mut self, buf: &mut Buffer, a: Rect, t: f32) {
@@ -978,6 +1146,12 @@ fn dir_of(code: KeyCode) -> Option<Dir> {
 
 fn short(code: &str) -> String {
     if code.len() > 16 { format!("{}…{}", &code[..8], &code[code.len() - 6..]) } else { code.to_string() }
+}
+
+/// Letter-spaced when it fits in `width` cells, plain otherwise.
+fn fit_spaced(s: &str, width: u16) -> String {
+    let sp = spaced(s);
+    if sp.chars().count() + 4 <= width as usize { sp } else { s.to_string() }
 }
 
 fn tail(s: &str, max: usize) -> String {
