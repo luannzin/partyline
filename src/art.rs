@@ -53,6 +53,21 @@ impl Img {
         }
         [rgb[0] / a / 255.0, rgb[1] / a / 255.0, rgb[2] / a / 255.0, a / wsum / 255.0]
     }
+
+    /// Bounds (x0, y0, x1, y1, exclusive) of the mostly opaque pixels in rows `y0..y1`,
+    /// relative to row `y0`.
+    fn opaque_box(&self, y0: usize, y1: usize) -> [f32; 4] {
+        let mut b = [f32::MAX, f32::MAX, 0.0f32, 0.0f32];
+        for y in y0..y1 {
+            for x in 0..self.w {
+                if self.px[y * self.w + x][3] > 127 {
+                    let (fx, fy) = (x as f32, (y - y0) as f32);
+                    b = [b[0].min(fx), b[1].min(fy), b[2].max(fx + 1.0), b[3].max(fy + 1.0)];
+                }
+            }
+        }
+        b
+    }
 }
 
 pub fn rgb(p: [f32; 4]) -> Rgb {
@@ -84,6 +99,8 @@ pub struct Art {
     pub room_b: Img,
     pub frames: usize,
     pub frame_h: usize,
+    /// Where the TV glass is in each dolly frame (x0, y0, x1, y1 in image pixels).
+    pub glass: Vec<[f32; 4]>,
     /// Contestants 0..8 side by side (index = player hue), then the empty chair.
     pub crew: Img,
     pub chamber: Img,
@@ -115,11 +132,14 @@ pub fn get() -> &'static Art {
             *acc += a + 2.0 * pad;
             Some(at)
         });
+        let room_b = Img::decode(include_bytes!("../assets/room_b.png"));
+        let frames = room_a.h / frame_h;
         Art {
-            frames: room_a.h / frame_h,
+            glass: (0..frames).map(|i| room_b.opaque_box(i * frame_h, (i + 1) * frame_h)).collect(),
+            frames,
             frame_h,
             room_a,
-            room_b: Img::decode(include_bytes!("../assets/room_b.png")),
+            room_b,
             crew: Img::decode(include_bytes!("../assets/crew.png")),
             chamber: Img::decode(include_bytes!("../assets/chamber.png")),
             font: Font { img: Img::decode(include_bytes!("../assets/font.png")), cap, pad, x: x.collect(), adv },

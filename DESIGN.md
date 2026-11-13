@@ -53,15 +53,32 @@ in. An eliminated player's hue drains toward grey (`Rgb::grey`).
 
 ## Type
 
-- Display: Bahnschrift Bold Condensed, distressed, area-sampled from a 56 px cap atlas to any
-  size (`Canvas::type_at` by cap height in pixels; `Canvas::big` is `7 * scale`). Bone-to-amber
-  gradient; the logo adds a moving shimmer.
-- TV menu: a channel wheel. The highlighted channel is set in the display font on the glass
-  (6 to 12 px caps, one size per page, chosen to fit the tube), its neighbours dim above and
-  below in the terminal font, its value in an input plate under it. `CH 01` in TV green.
-- Body: the terminal's own font, sentence case for guidance. Small headings are spaced caps
-  (`gfx::spaced`). Key hints are bone keycaps followed by a dim verb (`gfx::keys`).
-- Lobby nameplates: your own lit in your hue, the others' names in their hue on a dark plate.
+Every word on screen is pixels drawn into the canvas; no terminal glyph is ever shown. Two
+faces, all caps (accented letters fold to their base letter):
+
+- Display: Bahnschrift Bold Condensed, distressed, area-sampled from a 56 px cap atlas
+  (`Canvas::type_at` by cap height; `Canvas::big` is `7 * scale`). 7 px caps and up only:
+  below that it turns to mush. Logo, titles, the TV menu's channel, champion, big numbers.
+  Bone-to-amber gradient with a drop shadow; the logo adds a moving shimmer.
+- Small: a crisp 5 px caps bitmap face with square DIN shapes to sit beside Bahnschrift
+  (`gfx::glyph`), 1 px tracking, 1 px drop shadow, tabular digits, 7 px line pitch. Labels,
+  hints, notes, names in tight places. Headings in it are spaced (2 px tracking, falling back
+  to 1 when they don't fit: `Canvas::heading`). Wrapping is balanced (`wrap_label`); cuts end
+  in an ellipsis (`fit_label`); a typed value keeps its end in view (`tail_label`); counts pick
+  the longest wording that fits (`pick_label`).
+- Plates: chips are the small face on a 7 px plate (`Canvas::chip`). Key hints are bone keycaps
+  with a dim verb (`Canvas::keys`); when they don't all fit they take turns, a page every 3 s.
+- TV menu: a channel wheel. The channel on air is set in the display font on the glass (7 to
+  12 px caps, one size per page), captioned by its channel number in TV green or, for a
+  setting, by what it is (the headline is then the value; typing happens in it). Neighbours
+  sit dim above and below when the tube has room. Parts give way in order (neighbours, logo
+  size, status line) until it fits; small windows also move the camera in along the dolly
+  until the glass is at least 60 x 40 px (`room::rest`). News and page status the glass has no
+  room for go on the wall above the TV.
+- Lobby nameplates: your own lit in your hue, the others' names in their hue on a dark plate;
+  nameplates wider than a seat alternate high and low. READY rides on the contestant's feet.
+- Overlays drawn after a game (score bar, camera lower third, toast) read the frame back into
+  pixels (`Canvas::from_buf`) and draw on that.
 
 ## Motion
 

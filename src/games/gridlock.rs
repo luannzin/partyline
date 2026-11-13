@@ -3,7 +3,7 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use serde::{Deserialize, Serialize};
 
 use super::{Fx, Local, View, stage};
-use crate::gfx::{Canvas, Rgb, ctext, hash, pal, text};
+use crate::gfx::{Canvas, LINE, Rgb, SMALL, fit_label, hash, pal};
 use crate::proto::{Dir, Event, Input, Pid};
 
 pub const W: i32 = 84;
@@ -266,33 +266,28 @@ impl S {
         let dt = (v.t - l.pt).clamp(0.0, 0.1);
         l.pt = v.t;
         l.draw_parts(&mut cv, dt, 40.0);
-        cv.blit(buf, a);
 
-        // Side legend when the arena leaves room for it.
-        if ox >= 16 {
+        // Side legend when the arena leaves room for it: names in their trail's color, grey
+        // once crashed.
+        if ox >= 24 {
             for (i, b) in self.bikes.iter().enumerate() {
-                let y = a.y as i32 + oy / 2 + i as i32 * 2;
                 let c = if b.alive { v.hue(b.p) } else { v.hue(b.p).grey() };
-                text(buf, a, a.x as i32 + 3, y, &v.name(b.p), c);
-                text(buf, a, a.x as i32 + 3, y + 1, if b.alive { "moving" } else { "crashed" }, if b.alive { pal::DIM } else { pal::RED.mul(0.8) });
+                cv.label(4, oy + i as i32 * LINE, &fit_label(&v.name(b.p), ox - 8, 1), c, 1);
             }
         }
-
-        // Labels.
-        let alive = self.bikes.iter().filter(|b| b.alive).count();
-        let label = format!("{alive} OF {} STILL MOVING", self.bikes.len());
-        ctext(buf, a, a.y as i32, &label, pal::DIM);
+        let cx = cv.w / 2;
         if let Some(me) = self.bikes.iter().find(|b| b.p == v.me) {
             if !me.alive {
-                ctext(buf, a, a.bottom() as i32 - 1, "you crashed - watch who survives", pal::RED);
+                cv.chip_center(cx, cv.h - 2 - SMALL - 2, &fit_label("CRASHED · WATCH WHO SURVIVES", cv.w - 12, 1), pal::INK, pal::RED.mul(0.7));
             } else if self.steps < 30 {
-                let (x, y) = (a.x as i32 + ox + me.x as i32 * s, a.y as i32 + (oy + me.y as i32 * s) / 2 - 1);
-                text(buf, a, x - 1, y, "YOU", pal::INK);
+                let (x, y) = (ox + me.x as i32 * s + s / 2, oy + me.y as i32 * s - SMALL - 3);
+                cv.label_center(x, y, "YOU", pal::INK, 1);
             }
         }
         if self.shrink > 0 && self.shrink < 3 {
-            ctext(buf, a, a.bottom() as i32 - 1, "the walls are closing in", pal::GOLD);
+            cv.chip_center(cx, cv.h - 2 - SMALL - 2, "THE WALLS ARE CLOSING IN", pal::STAGE_DEEP, pal::GOLD);
         }
+        cv.blit(buf, a);
     }
 }
 

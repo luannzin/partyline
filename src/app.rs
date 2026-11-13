@@ -9,7 +9,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::games::{Fx, Game, Local, View, derby};
-use crate::gfx::{self, Rgb, big_width, ctext, ease_in_out, ease_out, hash, hue, keys, pal, prog, spaced, text, text_bg, type_rows, type_width};
+use crate::gfx::{
+    self, Canvas, Hint, LINE, Rgb, SMALL, big_width, ease_in_out, ease_out, fit_label, hash, hue, label_width, pal, prog, tail_label, type_h, type_width,
+    wrap_label,
+};
 use crate::net::{self, Conn, Lan, Net, RoomAd};
 use crate::proto::{ClientMsg, Dir, Event, Input, Kind, Phase, Pid, ServerMsg, Session};
 use crate::room;
@@ -41,29 +44,14 @@ enum Page {
     Password,
     /// Headline, then what it is connecting to.
     Connecting(String, String),
-    Error(String),
+    /// Headline, then a short line on what to do about it.
+    Error(String, String),
 }
 
-/// The line under the highlighted channel.
-enum Sub {
-    Note(String),
-    /// A value in an input plate; `true` when it is a placeholder.
-    Field(String, bool),
-}
-
-/// Where the TV menu's parts sit, in rows from the top of the glass.
-struct Tv {
-    /// Logo scale; 0 = a small spaced title instead.
-    logo: i32,
-    /// Cap height of the highlighted channel in pixels; 0 = no room, it becomes a pill.
-    cap: f32,
-    /// Neighbouring channels shown above and below.
-    wheel: bool,
-    prev: i32,
-    big: i32,
-    sub: i32,
-    next: i32,
-}
+/// Room the TV glass must have for the menu, in canvas pixels; small windows move the camera
+/// closer until it does.
+const MENU_W: f32 = 60.0;
+const MENU_H: f32 = 40.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Field {
@@ -294,7 +282,7 @@ impl App {
                 Ok(Err(e)) => {
                     self.pending = None;
                     self.shutdown_hosting();
-                    self.goto(Page::Error(friendly(&e)));
+                    self.fail(friendly(&e));
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
                 Err(_) => self.pending = None,
@@ -321,7 +309,7 @@ impl App {
             self.on_frame(now, s, ev);
         }
         if lost {
-            self.leave(Some("The show went off the air. The host left or the connection dropped.".into()));
+            self.leave(Some(("OFF THE AIR", "the line to the host dropped")));
         }
 
         // Mode transitions.
@@ -345,7 +333,7 @@ impl App {
             (Page::Main, 0) | (Page::Host, _) => TV_COLD.lerp(pal::GOLD, 0.6),
             (Page::Main, 1) | (Page::Join | Page::Code | Page::Password, _) => TV_COLD.lerp(hue(1), 0.6),
             (Page::Main, 2) => TV_COLD.lerp(hue(4), 0.6),
-            (Page::Main, _) | (Page::Error(_), _) => TV_COLD.lerp(pal::RED, 0.65),
+            (Page::Main, _) | (Page::Error(..), _) => TV_COLD.lerp(pal::RED, 0.65),
             _ => TV_COLD,
         };
         self.glow = self.glow.lerp(target, 1.0 - (-dt * 9.0).exp());
@@ -456,12 +444,15 @@ impl App {
         self.sfx.play(Sound::Static);
     }
 
-    /// The channels on the current page. Labels are short: the highlighted one is set in the
-    /// display font on the glass.
+    fn fail(&mut self, (head, why): (&str, &str)) {
+        self.goto(Page::Error(head.into(), why.into()));
+    }
+
+    /// The channels on the current page, by name (what the neighbours on the wheel show).
     fn items(&self) -> Vec<(String, Item)> {
         let s = |l: &str, it: Item| (l.to_string(), it);
         match &self.page {
-            Page::Main => vec![s("HOST A ROOM", Item::Host), s("JOIN A ROOM", Item::Join), s("NAME", Item::Name), s("QUIT", Item::Quit)],
+            Page::Main => vec![s("HOST A ROOM", Item::Host), s("JOIN A ROOM", Item::Join), s("YOUR NAME", Item::Name), s("QUIT", Item::Quit)],
             Page::Host => vec![
                 s("ROOM NAME", Item::RoomName),
                 s("PASSWORD", Item::Password),
@@ -475,50 +466,33 @@ impl App {
                 v.push(s("BACK", Item::BackMain));
                 v
             }
-            Page::Code => vec![s("CODE", Item::Code), s("TUNE IN", Item::CodeGo), s("BACK", Item::BackJoin)],
+            Page::Code => vec![s("INVITE CODE", Item::Code), s("TUNE IN", Item::CodeGo), s("BACK", Item::BackJoin)],
             Page::Password => vec![s("PASSWORD", Item::JoinPw), s("TUNE IN", Item::PwGo), s("BACK", Item::BackJoin)],
             Page::Connecting(..) => vec![],
-            Page::Error(_) => vec![s("OK", Item::Ok)],
+            Page::Error(..) => vec![s("OK", Item::Ok)],
         }
     }
 
-    /// What the highlighted channel does, or the value it holds.
-    fn sub(&self, it: Item) -> Sub {
-        let note = |s: &str| Sub::Note(s.into());
-        let secret = |s: &str, none: &str| {
-            if s.is_empty() { Sub::Field(none.into(), true) } else { Sub::Field("•".repeat(s.chars().count()), false) }
-        };
+    /// A channel on air: its headline (a setting shows its value, dim when it is a
+    /// placeholder) and what its caption adds after the channel number.
+    fn channel(&self, it: Item, name: &str) -> (String, bool, Option<String>) {
+        let setting = |v: String, empty: &str| (if v.is_empty() { empty.to_string() } else { v.clone() }, v.is_empty(), Some(name.to_string()));
+        let stars = |s: &str| "*".repeat(s.chars().count());
         match it {
-            Item::Host => note("open a room for your friends"),
-            Item::Join => note("find one on your network, or use a code"),
-            Item::Name => Sub::Field(self.name.to_uppercase(), false),
-            Item::Quit => note("switch the TV off"),
-            Item::RoomName => Sub::Field(self.room.to_uppercase(), false),
-            Item::Password => secret(&self.password, "none · anyone can join"),
-            Item::Bots => Sub::Field(format!("‹   {}   ›", self.bots), false),
-            Item::Open => note("open the room and wait for players"),
-            Item::Room(i) => note(if self.lan.get(i).is_some_and(|r| r.locked) { "locked · needs the password" } else { "open · anyone can join" }),
-            Item::Code if self.page == Page::Join => note("for rooms outside your network"),
-            Item::Code if self.code.is_empty() => Sub::Field("paste it here".into(), true),
-            Item::Code => Sub::Field(short(&self.code), false),
-            Item::JoinPw => secret(&self.join_pw, "type the password"),
-            Item::CodeGo | Item::PwGo => note("connect to the room"),
-            Item::BackMain | Item::BackJoin | Item::Ok => note(""),
-        }
-    }
-
-    /// The big line on the glass: the highlighted channel, or the page's own headline.
-    fn headline(&self) -> String {
-        match &self.page {
-            Page::Connecting(head, _) => head.clone(),
-            Page::Error(_) => "NO SIGNAL".into(),
-            _ => self.items().get(self.sel).map(|i| i.0.clone()).unwrap_or_default(),
+            Item::Name => setting(self.name.to_uppercase(), "NOBODY"),
+            Item::RoomName => setting(self.room.to_uppercase(), "UNNAMED"),
+            Item::Password => setting(stars(&self.password), "NONE"),
+            Item::Bots => (format!("< {} >", self.bots), false, Some(name.to_string())),
+            Item::Code if self.page == Page::Code => setting(if self.code.is_empty() { String::new() } else { short(&self.code) }, "PASTE IT"),
+            Item::JoinPw => setting(stars(&self.join_pw), "TYPE IT"),
+            Item::Room(i) if self.lan.get(i).is_some_and(|r| r.locked) => (name.to_string(), false, Some("LOCKED".into())),
+            _ => (name.to_string(), false, None),
         }
     }
 
     /// Pages that wear the PARTYLINE logo; the rest get a small title.
     fn branded(&self) -> bool {
-        matches!(self.page, Page::Main | Page::Connecting(..) | Page::Error(_))
+        matches!(self.page, Page::Main | Page::Connecting(..) | Page::Error(..))
     }
 
     fn page_title(&self) -> &'static str {
@@ -532,9 +506,9 @@ impl App {
     }
 
     /// A line under the small title.
-    fn status(&self, t: f32) -> Option<String> {
+    fn status(&self) -> Option<String> {
         match &self.page {
-            Page::Join if self.lan.is_empty() => Some(format!("scanning your network{}", ".".repeat((t * 2.0) as usize % 3 + 1))),
+            Page::Join if self.lan.is_empty() => Some("scanning your network…".into()),
             Page::Join if self.lan.len() == 1 => Some("1 room on your network".into()),
             Page::Join => Some(format!("{} rooms on your network", self.lan.len())),
             Page::Password => self.target.as_ref().map(|r| r.1.to_uppercase()),
@@ -572,7 +546,7 @@ impl App {
             Item::Code => self.edit = Some((Field::Code, self.code.clone())),
             Item::CodeGo => match self.code.trim().parse::<EndpointId>() {
                 Ok(id) => self.join(id, self.join_pw.clone(), "BY INVITE CODE".into()),
-                Err(_) => self.goto(Page::Error("That invite code doesn't look right. Copy it again from the host's lobby.".into())),
+                Err(_) => self.fail(("BAD CODE", "copy it again from the lobby")),
             },
             Item::JoinPw => self.edit = Some((Field::JoinPw, self.join_pw.clone())),
             Item::PwGo => {
@@ -613,8 +587,7 @@ impl App {
 
     fn join(&mut self, id: EndpointId, pw: String, label: String) {
         let Some(net) = &self.net else {
-            let why = self.net_err.clone().unwrap_or_else(|| "The network is still warming up. Try again in a second.".into());
-            self.goto(Page::Error(why));
+            self.fail(if self.net_err.is_some() { ("OFFLINE", "the network didn't start") } else { ("NOT YET", "the network is warming up") });
             return;
         };
         let (tx, rx) = oneshot::channel();
@@ -639,7 +612,7 @@ impl App {
         }
     }
 
-    fn leave(&mut self, why: Option<String>) {
+    fn leave(&mut self, why: Option<(&str, &str)>) {
         self.conn = None;
         self.shutdown_hosting();
         self.game_id = None;
@@ -647,7 +620,7 @@ impl App {
         self.mode = if self.calm || self.session.is_none() { Mode::Room } else { Mode::PowerOff(t) };
         self.sfx.play(Sound::Back);
         match why {
-            Some(w) => self.goto(Page::Error(w)),
+            Some(w) => self.fail(w),
             None => self.goto(Page::Main),
         }
     }
@@ -842,18 +815,24 @@ impl App {
         self.area = a;
         let buf = f.buffer_mut();
         if a.width < 80 || a.height < 24 {
-            gfx::Canvas::for_area(a, pal::STAGE_DEEP).blit(buf, a);
-            ctext(buf, a, a.y as i32 + a.height as i32 / 2 - 1, "PARTYLINE needs a window of at least 80 x 24.", pal::INK);
-            ctext(buf, a, a.y as i32 + a.height as i32 / 2 + 1, &format!("Yours is {} x {}. Make it a little bigger.", a.width, a.height), pal::DIM);
+            let mut cv = Canvas::for_area(a, pal::STAGE_DEEP);
+            let mut lines: Vec<(String, Rgb)> = wrap_label("PartyLine needs a window of at least 80 x 24.", cv.w - 6).into_iter().map(|l| (l, pal::INK)).collect();
+            lines.extend(wrap_label(&format!("Yours is {} x {}.", a.width, a.height), cv.w - 6).into_iter().map(|l| (l, pal::DIM)));
+            let y0 = cv.h / 2 - lines.len() as i32 * LINE / 2;
+            for (i, (l, c)) in lines.iter().enumerate() {
+                cv.label_center(cv.w / 2, y0 + i as i32 * LINE, l, *c, 1);
+            }
+            cv.blit(buf, a);
             return;
         }
         let t = self.t();
+        let rest = room::rest(a, MENU_W, MENU_H);
         match self.mode {
-            Mode::Room => self.draw_room(buf, a, 0.0, true),
-            Mode::ZoomIn(s) => self.draw_room(buf, a, ease_in_out(prog(t, s, ZOOM_IN)), false),
+            Mode::Room => self.draw_room(buf, a, rest, true),
+            Mode::ZoomIn(s) => self.draw_room(buf, a, rest + (1.0 - rest) * ease_in_out(prog(t, s, ZOOM_IN)), false),
             Mode::ZoomOut(s) => {
                 let p = ease_in_out(prog(t, s, ZOOM_OUT));
-                self.draw_room(buf, a, 1.0 - p, p > 0.9);
+                self.draw_room(buf, a, 1.0 - (1.0 - rest) * p, p > 0.9);
             }
             Mode::Studio(s) => {
                 self.draw_studio(buf, a, t);
@@ -866,203 +845,242 @@ impl App {
         }
     }
 
-    /// The room, `p` of the way along the dolly into the TV; `menu` draws the TV menu on the glass.
+    /// The room, `p` of the way along the dolly into the TV; `menu` puts the TV menu on the glass.
     fn draw_room(&self, buf: &mut Buffer, a: Rect, p: f32, menu: bool) {
         let t = self.t();
         let mut shot = room::draw(a, p, t, self.glow);
-        let sr = shot.screen(a);
-        let tv = (menu && sr.width > 10 && sr.height > 6).then(|| self.tv(sr, t));
-        if let Some(l) = &tv {
-            self.menu_pixels(&mut shot.cv, a, sr, l, t);
+        if menu {
+            let status = self.menu(&mut shot.cv, shot.glass, t);
+            self.notice(&mut shot.cv, shot.glass.1, status);
         }
         shot.cv.blit(buf, a);
-        if let Some(l) = &tv {
-            self.menu_cells(buf, sr, l, t);
-        }
     }
 
-    /// Lay the menu out on the glass `sr`: logo (or a small title), then a channel wheel: the
-    /// previous channel, the highlighted one big in the display font with its line under it,
-    /// the next channel; key hints on the last row. Everything shrinks to fit the tube.
-    fn tv(&self, sr: Rect, t: f32) -> Tv {
-        let (w, foot) = (sr.width as i32, sr.height as i32 - 1);
-        let wheel = self.items().len() > 1;
-        let subs = match &self.page {
-            Page::Error(m) => wrap(m, (w - 6).max(8) as usize).len() as i32,
-            _ => 1,
+    /// Lines on the wall above the TV: news (a new version waiting, the network's state), then
+    /// the page's status when the glass had no room for it.
+    fn notice(&self, cv: &mut Canvas, glass_top: i32, status: Option<String>) {
+        let news = if let Some(tag) = &self.updated {
+            Some((format!("{tag} installed · restart to play"), pal::GOLD))
+        } else if self.net_err.is_some() {
+            Some(("no network".to_string(), pal::DIM))
+        } else if self.net.is_none() {
+            Some(("warming up the network…".to_string(), pal::DIM))
+        } else {
+            None
         };
-        let fixed = subs + if wheel { 2 } else { 0 };
-        let small = if self.status(t).is_some() { 3 } else { 2 };
-        // The logo sits 4 pixels down; a 4-row headline must still fit under it.
-        let (logo, top) = [2, 1]
-            .into_iter()
-            .filter(|_| self.branded())
-            .map(|l| (l, (5 + 8 * l) / 2 + 1))
-            .find(|&(l, top)| big_width("PARTYLINE", l) <= w - 4 && foot - top >= fixed + 4)
-            .unwrap_or((0, small));
-        // One size for every channel on the page, so the label doesn't jump while flipping; a
-        // label too long for any size gets its own.
-        let avail = foot - top - fixed;
-        let head = vec![self.headline()];
-        let labels = if wheel { self.items().into_iter().map(|i| i.0).collect() } else { head.clone() };
-        let fits = |c: f32, ls: &[String]| type_rows(c) <= avail && ls.iter().all(|s| type_width(s, c) <= w - 4);
-        let sizes = [12.0, 10.0, 9.0, 8.0, 7.0, 6.0];
-        let cap = sizes.into_iter().find(|&c| fits(c, &labels)).or_else(|| sizes.into_iter().find(|&c| fits(c, &head))).unwrap_or(0.0);
-        let rows = if cap > 0.0 { type_rows(cap) } else { 1 };
-        let g = ((avail - rows) / if wheel { 3 } else { 2 }).clamp(0, 1);
-        let used = rows + fixed + if wheel { 2 * g } else { g };
-        let prev = top + ((foot - top - used) / 2).max(0);
-        let big = if wheel { prev + 1 + g } else { prev };
-        let sub = big + rows + if wheel { 0 } else { g };
-        Tv { logo, cap, wheel, prev, big, sub, next: sub + subs + g }
+        let lines: Vec<(String, Rgb)> = news.into_iter().chain(status.map(|s| (s, pal::INK))).collect();
+        // Centered on the wall, clear of the cabinet's top edge when there is room for that.
+        let wall = if glass_top - 6 >= LINE { glass_top - 6 } else { glass_top - 1 };
+        let fit = (wall / LINE).max(0) as usize;
+        let shown = &lines[lines.len().saturating_sub(fit)..];
+        let mut y = (wall - shown.len() as i32 * LINE) / 2 + 1;
+        for (s, c) in shown {
+            cv.label_center(cv.w / 2, y, &fit_label(s, cv.w - 8, 1), *c, 1);
+            y += LINE;
+        }
     }
 
-    /// The menu's pixel layer: logo, the highlighted channel in the display font, and snow
-    /// while there is no signal.
-    fn menu_pixels(&self, cv: &mut gfx::Canvas, a: Rect, sr: Rect, l: &Tv, t: f32) {
-        if t - self.chan_t < 0.14 {
-            return;
+    /// The TV menu on the glass `g` (x0, y0, x1, y1 in canvas pixels, inclusive). Top to
+    /// bottom: the logo (or a small title), the channel wheel (the channel on air big in the
+    /// display font under its caption, its neighbours dim above and below), key hints. Parts
+    /// give way, least useful first, until it fits the tube.
+    /// Returns the page's status line when the glass had no room for it.
+    fn menu(&self, cv: &mut Canvas, g: (i32, i32, i32, i32), t: f32) -> Option<String> {
+        let (gx, gy, gw, gh) = (g.0, g.1, g.2 - g.0 + 1, g.3 - g.1 + 1);
+        if gw < 24 || gh < 20 {
+            return self.status();
         }
-        let (gx, gy, gw, gh) = ((sr.x - a.x) as i32, (sr.y - a.y) as i32 * 2, sr.width as i32, sr.height as i32 * 2);
-        let cx = gx + gw / 2;
-        let (connecting, error) = (matches!(self.page, Page::Connecting(..)), matches!(self.page, Page::Error(_)));
+        if t - self.chan_t < 0.14 {
+            snow(cv, g, 0.85, (t * 120.0) as u32);
+            return None;
+        }
+        let (cx, maxw) = (gx + gw / 2, gw - 8);
+        let (connecting, error) = (matches!(self.page, Page::Connecting(..)), matches!(self.page, Page::Error(..)));
         if connecting || error {
-            let seed = (t * 30.0) as u32;
-            for y in gy..gy + gh {
-                for x in gx..gx + gw {
-                    let (nx, ny) = ((x - gx) as f32 / gw as f32 * 2.0 - 1.0, (y - gy) as f32 / gh as f32 * 2.0 - 1.0);
-                    let fade = 1.0 - (nx.abs().powi(6) + ny.abs().powi(6)).min(1.0);
-                    let g = (hash(seed ^ (x as u32).wrapping_mul(31), y as u32) % 100) as f32 / 100.0;
-                    cv.blend(x, y, Rgb(g, g, g), if error { 0.16 } else { 0.1 } * fade);
-                }
-            }
+            snow(cv, g, if error { 0.16 } else { 0.1 }, (t * 30.0) as u32);
         }
-        if l.logo > 0 {
-            let (s, w) = (l.logo, big_width("PARTYLINE", l.logo));
-            cv.big_center(cx, gy + 4, "PARTYLINE", s, &|x, y| {
-                let sweep = ((t * 0.4).fract() * (w + 30) as f32) as i32 - 15;
-                let c = pal::INK.lerp(pal::GOLD, y as f32 / (7 * s) as f32);
-                if (x + y / 2 - sweep).abs() < 2 { c.lerp(pal::INK, 0.7) } else { c }
-            });
-        }
-        if l.cap > 0.0 {
-            let cap = l.cap;
-            let k = ease_out(prog(t, self.sel_t, 0.2));
-            let by = gy + 2 * l.big + ((1.0 - k) * 4.0).round() as i32 * self.sel_dir;
-            let (c0, c1) = if error { (pal::ORANGE, pal::RED) } else { (pal::INK, pal::GOLD) };
-            let lit = if connecting { 0.8 + 0.2 * (t * 5.0).sin() } else { 0.4 + 0.6 * k };
-            cv.light(cx as f32, by as f32 + cap * 0.5, gw as f32 * 0.4, self.glow, 0.1);
-            cv.type_center(cx, by, &self.headline(), cap, &|_, y| c0.lerp(c1, y as f32 / cap).mul(lit));
-        }
-    }
-
-    /// The menu's text layer, over the pixels: on-screen display, title, the wheel's neighbours,
-    /// the line under the highlighted channel, key hints.
-    fn menu_cells(&self, buf: &mut Buffer, sr: Rect, l: &Tv, t: f32) {
-        // Channel-change static.
-        if t - self.chan_t < 0.14 {
-            let seed = (t * 120.0) as u32;
-            for y in sr.top()..sr.bottom() {
-                for x in sr.left()..sr.right() {
-                    let h = hash(seed ^ x as u32 * 13, y as u32);
-                    let g = (h % 100) as f32 / 100.0;
-                    let c = &mut buf[(x, y)];
-                    c.set_symbol(["░", "▒", "▓", " "][(h >> 8) as usize % 4]);
-                    c.fg = Rgb(g, g, g).color();
-                    c.bg = Rgb(g * 0.3, g * 0.3, g * 0.35).color();
-                }
-            }
-            return;
-        }
-        let row = |r: i32| sr.y as i32 + r;
-        let foot = row(sr.height as i32 - 1);
         let items = self.items();
         let n = items.len();
-        // On-screen display: the channel number in TV green (it flares when it changes) and
-        // the tape light.
-        if l.wheel {
-            let pop = 1.0 - prog(t, self.sel_t, 0.45);
-            text(buf, sr, sr.x as i32 + 3, row(0), &format!("CH {:02}", self.sel + 1), pal::GREEN.lerp(pal::INK, pop));
-        }
-        let live = if (t * 1.4).fract() < 0.6 { pal::RED } else { pal::PODIUM_DARK };
-        text(buf, sr, sr.right() as i32 - 9, row(0), "● REC", live);
-        if l.logo == 0 {
-            ctext(buf, sr, row(1), &fit_spaced(self.page_title(), sr.width), pal::GOLD);
-        }
-        if let Some(s) = self.status(t) {
-            ctext(buf, sr, row(2), &s, pal::DIM);
-        }
+        let wheel = n > 1;
 
-        // The wheel: neighbours, dim, above and below the highlighted channel.
-        if l.wheel {
-            let dim = pal::DIM.mul(0.8);
-            if n > 2 {
-                ctext(buf, sr, row(l.prev), &items[(self.sel + n - 1) % n].0, dim);
-            }
-            ctext(buf, sr, row(l.next), &items[(self.sel + 1) % n].0, dim);
-        }
-        if l.cap == 0.0 {
-            let pill = format!("  {}  ", self.headline());
-            let x = sr.x as i32 + (sr.width as i32 - pill.chars().count() as i32) / 2;
-            text_bg(buf, sr, x, row(l.big), &pill, pal::STAGE_DEEP, pal::GOLD);
-        }
-        match &self.page {
-            Page::Error(m) => {
-                for (i, line) in wrap(m, (sr.width as i32 - 6).max(8) as usize).iter().enumerate() {
-                    ctext(buf, sr, row(l.sub) + i as i32, line, pal::INK);
+        // What is on air: the headline, its caption, and for errors what to do about it.
+        let typed = self.edit.as_ref().map(|(f, s)| if matches!(f, Field::Password | Field::JoinPw) { "*".repeat(s.chars().count()) } else { s.to_uppercase() });
+        let (head, placeholder, extra) = match &self.page {
+            Page::Connecting(h, _) | Page::Error(h, _) => (h.clone(), false, None),
+            _ => match items.get(self.sel) {
+                Some((name, it)) => {
+                    let (h, p, e) = self.channel(*it, name);
+                    (typed.clone().unwrap_or(h), p && typed.is_none(), e)
                 }
-            }
-            Page::Connecting(_, what) => ctext(buf, sr, row(l.sub), &fit_spaced(what, sr.width), pal::DIM),
-            _ => {
-                if let Some(&(_, it)) = items.get(self.sel) {
-                    self.draw_sub(buf, sr, row(l.sub), it, t);
-                }
-            }
-        }
-
-        // Key hints, unless there is news for the footer.
-        if self.edit.is_some() {
-            keys(buf, sr, foot, &[("ENTER", "save"), ("ESC", "cancel")]);
-        } else if let Page::Connecting(..) = self.page {
-            keys(buf, sr, foot, &[("ESC", "cancel")]);
-        } else if let Page::Error(_) = self.page {
-            keys(buf, sr, foot, &[("ENTER", "ok")]);
-        } else if let Some(tag) = &self.updated {
-            ctext(buf, sr, foot, &format!("{tag} installed · restart to play it"), pal::GOLD);
-        } else if let Some(e) = &self.net_err {
-            ctext(buf, sr, foot, &format!("offline: {}", e.chars().take(sr.width as usize - 12).collect::<String>()), pal::DIM);
-        } else if self.net.is_none() {
-            ctext(buf, sr, foot, "warming up the network…", pal::DIM);
-        } else {
-            let mut k = vec![];
-            if items.get(self.sel).map(|i| i.1) == Some(Item::Bots) {
-                k.push(("←→", "bots"));
-            }
-            k.extend([("↑↓", "channel"), ("ENTER", "select")]);
-            if self.page != Page::Main {
-                k.push(("ESC", "back"));
-            }
-            keys(buf, sr, foot, &k);
-        }
-    }
-
-    /// The line under the highlighted channel: a note, or its value in an input plate (bone
-    /// with a caret while typing).
-    fn draw_sub(&self, buf: &mut Buffer, sr: Rect, y: i32, it: Item, t: f32) {
-        let (content, fg, bg) = match (self.sub(it), &self.edit) {
-            (Sub::Note(s), _) => return ctext(buf, sr, y, &s, pal::DIM),
-            (Sub::Field(..), Some((f, typed))) => {
-                let shown = if matches!(f, Field::Password | Field::JoinPw) { "•".repeat(typed.chars().count()) } else { typed.to_uppercase() };
-                let caret = if (t * 2.0).fract() < 0.5 { "▏" } else { " " };
-                (format!("{}{caret}", tail(&shown, (sr.width as usize).saturating_sub(10))), pal::STAGE_DEEP, pal::INK)
-            }
-            (Sub::Field(v, placeholder), None) => (v, if placeholder { pal::DIM } else { pal::INK }, pal::PANEL.lerp(pal::INK, 0.1)),
+                None => (String::new(), false, None),
+            },
         };
-        let n = content.chars().count() as i32;
-        let w = (n + 4).max(16).min(sr.width as i32 - 4);
-        let x = sr.x as i32 + (sr.width as i32 - w) / 2;
-        text_bg(buf, sr, x, y, &" ".repeat(w.max(0) as usize), fg, bg);
-        text_bg(buf, sr, x + (w - n) / 2, y, &content, fg, bg);
+        let mut caption: Vec<(String, Rgb)> = match &self.page {
+            Page::Connecting(_, what) => vec![(what.clone(), pal::DIM)],
+            Page::Error(..) => vec![],
+            // A setting is captioned by what it is; anything else by its channel number, in TV
+            // green, flaring when it changes.
+            _ => match extra {
+                Some(e) => vec![(e, pal::INK.lerp(pal::DIM, 0.4))],
+                None => vec![(format!("CH {:02}", self.sel + 1), pal::GREEN.lerp(pal::INK, 1.0 - prog(t, self.sel_t, 0.45)))],
+            },
+        };
+        if let Some((last, rest)) = caption.split_last_mut() {
+            let others = label_width(&rest.iter().map(|c| c.0.as_str()).collect::<String>(), 1);
+            last.0 = fit_label(&last.0, gw - 4 - others, 1);
+        }
+        let body = match &self.page {
+            Page::Error(_, why) => wrap_label(why, maxw - 2),
+            _ => vec![],
+        };
+        let status = self.status();
+
+        // Fit: the first (logo scale, neighbours, status) that leaves room for the headline at
+        // 7 px caps or more wins, at the largest size that fits. One size for every channel on
+        // the page, so it doesn't jump while flipping; a channel too long for that gets its own.
+        let line = SMALL + 1;
+        let header = |logo: i32, st: bool| match logo {
+            -1 => 0,
+            0 => line + 1 + if st && status.is_some() { line + 1 } else { 0 } + 1,
+            l => type_h((7 * l) as f32) + 2,
+        };
+        let middle = |nb: bool, head_h: i32| {
+            (if nb { 2 * (line + 2) } else { 0 })
+                + if caption.is_empty() { 0 } else { line + 1 }
+                + head_h
+                + if body.is_empty() { 0 } else { 2 + body.len() as i32 * LINE - 1 }
+        };
+        let keys_h = SMALL + 3;
+        // Margins of 1 px at the top and bottom of the tube, 2 px above the key hints.
+        let fits_h = |logo: i32, nb: bool, st: bool, head_h: i32| header(logo, st) + middle(nb, head_h) + keys_h + 4 <= gh;
+        let logos: Vec<i32> = if self.branded() { [2, 1].into_iter().filter(|&l| big_width("PARTYLINE", l) <= maxw).collect() } else { vec![] };
+        let nbs = if wheel { vec![true, false] } else { vec![false] };
+        let mut configs: Vec<(i32, bool, bool)> = vec![];
+        for &nb in &nbs {
+            configs.extend(logos.iter().map(|&l| (l, nb, false)));
+        }
+        configs.extend(nbs.iter().map(|&nb| (0, nb, true)));
+        configs.extend([(0, false, false), (-1, false, false)]);
+        let heads: Vec<String> = if wheel { items.iter().map(|(name, it)| self.channel(*it, name).0).collect() } else { vec![head.clone()] };
+        let pick = |hs: &[String]| {
+            configs.iter().find_map(|&(l, nb, st)| {
+                let top = if l > 0 { (7 * l) as f32 } else { 12.0 };
+                [12.0f32, 10.0, 9.0, 8.0, 7.0]
+                    .into_iter()
+                    .find(|&c| c <= top && fits_h(l, nb, st, type_h(c)) && hs.iter().all(|h| type_width(h, c) <= maxw))
+                    .map(|c| (l, nb, st, c))
+            })
+        };
+        let (logo, nb, st, cap) = pick(&heads).or_else(|| pick(std::slice::from_ref(&head))).unwrap_or((-1, false, false, 0.0));
+        let head_h = if cap > 0.0 { type_h(cap) } else { line };
+        let st = st && logo == 0;
+
+        // Header.
+        let mut y = gy + 1;
+        let head_w = if logo > 0 {
+            let (s, w) = (logo, big_width("PARTYLINE", logo));
+            cv.big_center(cx, y, "PARTYLINE", s, &|x, yy| {
+                let sweep = ((t * 0.4).fract() * (w + 30) as f32) as i32 - 15;
+                let c = pal::INK.lerp(pal::GOLD, yy as f32 / (7 * s) as f32);
+                if (x + yy / 2 - sweep).abs() < 2 { c.lerp(pal::INK, 0.7) } else { c }
+            });
+            w
+        } else if logo == 0 {
+            let title = if self.branded() { "PARTYLINE" } else { self.page_title() };
+            cv.heading(cx, y + 1, title, pal::GOLD, maxw);
+            if let (true, Some(s)) = (st, &status) {
+                cv.label_center(cx, y + 1 + line + 1, &fit_label(s, maxw, 1), pal::DIM, 1);
+            }
+            gfx::label_width(title, 2)
+        } else {
+            0
+        };
+        y += header(logo, st);
+        // The tape light, in the corner when the header leaves room for it.
+        let dot = gx + gw - 9;
+        if logo >= 0 && dot > cx + head_w / 2 + 3 && (t * 1.4).fract() < 0.6 {
+            cv.label(dot, gy + 2, "●", pal::RED, 1);
+        }
+
+        // The wheel, centered between the header and the key hints.
+        let keys_y = gy + gh - 1 - keys_h;
+        let mut y = y + ((keys_y - 2 - y - middle(nb, head_h)) / 2).max(0);
+        let dim = pal::DIM.mul(0.85);
+        if nb {
+            if n > 2 {
+                cv.label_center(cx, y, &fit_label(&items[(self.sel + n - 1) % n].0, maxw, 1), dim, 1);
+            }
+            y += line + 2;
+        }
+        if !caption.is_empty() {
+            let w = label_width(&caption.iter().map(|c| c.0.as_str()).collect::<String>(), 1);
+            let mut x = cx - w / 2;
+            for (s, c) in &caption {
+                x += cv.label(x, y, s, *c, 1) + 1;
+            }
+            y += line + 1;
+        }
+        // The channel rolls in from the side it came from and brightens.
+        let roll = ease_out(prog(t, self.sel_t, 0.2));
+        let hy = y + ((1.0 - roll) * 4.0).round() as i32 * self.sel_dir;
+        let lit = if connecting { 0.8 + 0.2 * (t * 5.0).sin() } else { 0.4 + 0.6 * roll };
+        let (c0, c1) = if error {
+            (pal::ORANGE, pal::RED)
+        } else if placeholder {
+            (pal::DIM, pal::DIM)
+        } else {
+            (pal::INK, pal::GOLD)
+        };
+        cv.light(cx as f32, (hy + head_h / 2) as f32, gw as f32 * 0.4, self.glow, 0.1);
+        // Typing can outgrow the size: smaller, then the small face, then just its end.
+        let (end, top, h) = match [12.0f32, 10.0, 9.0, 8.0, 7.0].into_iter().find(|&c| c <= cap && type_width(&head, c) <= maxw) {
+            Some(c) => {
+                let top = hy + (head_h - type_h(c)) / 2;
+                cv.type_center(cx, top, &head, c, &|_, yy| c0.lerp(c1, yy as f32 / c).mul(lit));
+                (cx + type_width(&head, c) / 2, top, c.round() as i32)
+            }
+            None => {
+                let s = if typed.is_some() { tail_label(&head, maxw - 3) } else { fit_label(&head, maxw, 1) };
+                let top = hy + (head_h - line) / 2;
+                cv.label_center(cx, top, &s, c0.mul(lit), 1);
+                (cx + label_width(&s, 1) / 2, top, SMALL)
+            }
+        };
+        if typed.is_some() && (t * 2.0).fract() < 0.5 {
+            cv.rect(end + 2, top, 1, h + 1, pal::INK);
+        }
+        y += head_h;
+        if !body.is_empty() {
+            y += 2;
+            for l in &body {
+                cv.label_center(cx, y, l, pal::INK, 1);
+                y += LINE;
+            }
+            y -= 1;
+        }
+        if nb {
+            cv.label_center(cx, y + 2, &fit_label(&items[(self.sel + 1) % n].0, maxw, 1), dim, 1);
+        }
+
+        // Key hints.
+        let mut hints: Vec<Hint> = vec![];
+        if self.edit.is_some() {
+            hints.extend([("ENTER", "save"), ("ESC", "cancel")]);
+        } else if connecting {
+            hints.push(("ESC", "cancel"));
+        } else if error {
+            hints.push(("ENTER", "ok"));
+        } else {
+            if items.get(self.sel).map(|i| i.1) == Some(Item::Bots) {
+                hints.push(("←→", "bots"));
+            }
+            hints.extend([("↑↓", "channel"), ("ENTER", "select")]);
+            if self.page != Page::Main {
+                hints.push(("ESC", "back"));
+            }
+        }
+        cv.keys(cx, keys_y, gw - 6, &hints, t);
+        if st { None } else { status }
     }
 
     fn draw_studio(&mut self, buf: &mut Buffer, a: Rect, t: f32) {
@@ -1087,7 +1105,7 @@ impl App {
             Phase::Play(g) => {
                 let v = View { area: game_area(a), now, t, me, cam: self.cam, players: &s.players, calm: self.calm };
                 g.render(&v, &mut self.local, buf);
-                studio::hud(buf, a, s, g.kind());
+                studio::hud(buf, a, s, g.kind(), g.status(now));
                 let playing = s.player(me).is_some_and(|p| !p.spectator) && participates(g, me);
                 if !playing {
                     if let Some(p) = s.player(self.cam) {
@@ -1098,16 +1116,16 @@ impl App {
                     studio::go(buf, a, prog(t, self.go_t, 0.6));
                 }
             }
-            Phase::Results { kind, gains, until } => studio::results(buf, a, s, *kind, gains, *until, now, t, self.phase_since),
+            Phase::Results { gains, until, .. } => studio::results(buf, a, s, gains, *until, now, t, self.phase_since),
             Phase::Final => studio::finale(buf, a, s, host, t, self.phase_since, &mut self.local),
         }
         if let Some((msg, t0)) = &self.toast {
             let k = t - t0;
             if k < 1.6 {
-                let pill = format!("  {msg}  ");
-                let x = a.x as i32 + (a.width as i32 - pill.len() as i32) / 2;
-                let y = a.bottom() as i32 - 5 + if k < 0.2 { ((0.2 - k) * 10.0) as i32 } else { 0 };
-                text_bg(buf, a, x, y, &pill, pal::STAGE_DEEP, pal::GOLD);
+                let mut cv = Canvas::from_buf(buf, a);
+                let y = cv.h - 22 + if k < 0.2 { ((0.2 - k) * 20.0) as i32 } else { 0 };
+                cv.chip_center(cv.w / 2, y, msg, pal::STAGE_DEEP, pal::GOLD);
+                cv.blit(buf, a);
             }
         }
         gfx::tint(buf, a, self.fx.flash_c, self.fx.flash);
@@ -1121,8 +1139,23 @@ impl App {
     }
 }
 
+/// The screen under the score bar.
 fn game_area(a: Rect) -> Rect {
-    Rect::new(a.x, a.y + 1, a.width, a.height.saturating_sub(1))
+    Rect::new(a.x, a.y + studio::HUD_ROWS, a.width, a.height.saturating_sub(studio::HUD_ROWS))
+}
+
+/// TV snow over the glass `g` (x0, y0, x1, y1, inclusive), `a` strong, fading into the tube's
+/// corners.
+fn snow(cv: &mut Canvas, g: (i32, i32, i32, i32), a: f32, seed: u32) {
+    let (w, h) = ((g.2 - g.0 + 1) as f32, (g.3 - g.1 + 1) as f32);
+    for y in g.1..=g.3 {
+        for x in g.0..=g.2 {
+            let (nx, ny) = ((x - g.0) as f32 / w * 2.0 - 1.0, (y - g.1) as f32 / h * 2.0 - 1.0);
+            let fade = 1.0 - (nx.abs().powi(6) + ny.abs().powi(6)).min(1.0);
+            let v = (hash(seed ^ (x as u32).wrapping_mul(31), y as u32) % 100) as f32 / 100.0;
+            cv.blend(x, y, Rgb(v, v, v * 1.05), a * fade);
+        }
+    }
 }
 
 fn participates(g: &Game, me: Pid) -> bool {
@@ -1145,43 +1178,26 @@ fn dir_of(code: KeyCode) -> Option<Dir> {
 }
 
 fn short(code: &str) -> String {
-    if code.len() > 16 { format!("{}…{}", &code[..8], &code[code.len() - 6..]) } else { code.to_string() }
-}
-
-/// Letter-spaced when it fits in `width` cells, plain otherwise.
-fn fit_spaced(s: &str, width: u16) -> String {
-    let sp = spaced(s);
-    if sp.chars().count() + 4 <= width as usize { sp } else { s.to_string() }
-}
-
-fn tail(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    s.chars().skip(n.saturating_sub(max.max(4))).collect()
-}
-
-fn wrap(s: &str, width: usize) -> Vec<String> {
-    let mut lines = vec![String::new()];
-    for word in s.split_whitespace() {
-        let cur = lines.last_mut().unwrap();
-        if !cur.is_empty() && cur.len() + word.len() + 1 > width {
-            lines.push(word.to_string());
-        } else {
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(word);
-        }
+    match (code.get(..6), code.get(code.len().saturating_sub(4)..)) {
+        (Some(a), Some(b)) if code.len() > 12 => format!("{a}...{b}"),
+        _ => code.to_string(),
     }
-    lines
 }
 
-/// Turn network errors into something a player can act on.
-fn friendly(e: &anyhow::Error) -> String {
+/// Turn a failed connection into a headline and a short line a player can act on.
+fn friendly(e: &anyhow::Error) -> (&'static str, &'static str) {
     let raw = e.to_string();
-    if ["Wrong password", "full", "Timed out", "PartyLine v"].iter().any(|k| raw.contains(k)) {
-        return raw;
+    if raw.contains("Wrong password") {
+        ("WRONG PASSWORD", "ask the host for it")
+    } else if raw.contains("full") {
+        ("ROOM FULL", "eight players is the limit")
+    } else if raw.contains("Timed out") {
+        ("NO ANSWER", "the room took too long")
+    } else if raw.contains("PartyLine v") {
+        ("WRONG VERSION", "restart PartyLine to update")
+    } else {
+        ("NO SIGNAL", "is the host still in the lobby?")
     }
-    format!("Couldn't reach that room. Check the code, and that the host is still in the lobby. ({})", raw.chars().take(60).collect::<String>())
 }
 
 /// Copy to the system clipboard through the terminal (OSC 52; Windows Terminal, kitty, WezTerm, iTerm2).
@@ -1220,21 +1236,33 @@ mod tests {
         let mut app = App::new(rt.handle().clone(), Args { name: "LUAN".into(), bots: 3, calm: false, mute: true, update: false });
         let dir = std::path::Path::new("target/snap");
         std::fs::create_dir_all(dir).unwrap();
-        let save = |name: &str, buf: &Buffer| std::fs::write(dir.join(format!("{name}.html")), html(buf)).unwrap();
+        let save = |name: &str, buf: &Buffer| std::fs::write(dir.join(format!("{name}.png")), png(buf)).unwrap();
 
-        for (w, h) in [(140u16, 40u16), (100, 30)] {
+        app.net_err = Some("test".into());
+        for (w, h) in [(200u16, 50u16), (120, 30), (80, 24)] {
             let a = Rect::new(0, 0, w, h);
             let tag = format!("{w}x{h}");
-            let mut buf = Buffer::empty(a);
-            app.glow = TV_COLD.lerp(pal::GOLD, 0.6);
-            app.draw_room(&mut buf, a, 0.0, true);
-            save(&format!("room_{tag}"), &buf);
-            let mut buf = Buffer::empty(a);
-            app.page = Page::Join;
-            app.glow = TV_COLD.lerp(hue(1), 0.6);
-            app.draw_room(&mut buf, a, 0.0, true);
-            save(&format!("room_join_{tag}"), &buf);
+            let rest = room::rest(a, MENU_W, MENU_H);
+            app.chan_t = -10.0;
+            for (name, page, glow) in [
+                ("room", Page::Main, TV_COLD.lerp(pal::GOLD, 0.6)),
+                ("room_host", Page::Host, TV_COLD.lerp(pal::GOLD, 0.6)),
+                ("room_join", Page::Join, TV_COLD.lerp(hue(1), 0.6)),
+                ("room_error", Page::Error("NO SIGNAL".into(), "is the host still in the lobby?".into()), TV_COLD.lerp(pal::RED, 0.6)),
+                ("room_tuning", Page::Connecting("TUNING IN".into(), "LUAN'S ROOM".into()), TV_COLD),
+            ] {
+                let mut buf = Buffer::empty(a);
+                (app.page, app.glow, app.sel) = (page, glow, 0);
+                app.draw_room(&mut buf, a, rest, true);
+                save(&format!("{name}_{tag}"), &buf);
+            }
             app.page = Page::Main;
+            app.sel = 2;
+            app.edit = Some((Field::Name, "Luanzinho".into()));
+            let mut buf = Buffer::empty(a);
+            app.draw_room(&mut buf, a, rest, true);
+            save(&format!("room_edit_{tag}"), &buf);
+            (app.edit, app.sel) = (None, 0);
             let mut buf = Buffer::empty(a);
             app.draw_room(&mut buf, a, 0.6, false);
             save(&format!("zoom_{tag}"), &buf);
@@ -1274,7 +1302,7 @@ mod tests {
             g.input(3, &Input::Early, &mut ev);
             shot("blink", &s, &mut |b, s| {
                 g.render(&v(a, &s.players), &mut l, b);
-                studio::hud(b, a, s, Kind::Blink);
+                studio::hud(b, a, s, Kind::Blink, ("FLASH 2 OF 3".into(), pal::DIM));
             });
 
             let mut g = gridlock::S::new(&ids, 1, 0);
@@ -1288,7 +1316,7 @@ mod tests {
             }
             shot("gridlock", &s, &mut |b, s| {
                 g.render(&v(a, &s.players), &mut l, b);
-                studio::hud(b, a, s, Kind::Gridlock);
+                studio::hud(b, a, s, Kind::Gridlock, ("3 OF 4 MOVING".into(), pal::DIM));
             });
 
             let mut g = crate::games::derby::S::new(&ids, 2, 0);
@@ -1302,7 +1330,7 @@ mod tests {
             l2.pt = 10.0;
             shot("derby", &s, &mut |b, s| {
                 g.render(&v(a, &s.players), &mut l2, b);
-                studio::hud(b, a, s, Kind::Derby);
+                studio::hud(b, a, s, Kind::Derby, ("42 S LEFT".into(), pal::DIM));
             });
 
             let mut g = odd::S::new(&ids, 3, 0);
@@ -1313,11 +1341,11 @@ mod tests {
             let mut l3 = Local { reveal_t: 0.0, ..Local::default() };
             shot("odd", &s, &mut |b, s| {
                 g.render(&v(a, &s.players), &mut l3, b);
-                studio::hud(b, a, s, Kind::Odd);
+                studio::hud(b, a, s, Kind::Odd, ("QUESTION 2 OF 5".into(), pal::DIM));
             });
 
             let gains = vec![(1, 4), (2, 2), (4, 1), (3, 0)];
-            shot("results", &s, &mut |b, s| studio::results(b, a, s, Kind::Blink, &gains, 4000, 0, 10.0, 0.0));
+            shot("results", &s, &mut |b, s| studio::results(b, a, s, &gains, 4000, 0, 10.0, 0.0));
             s.phase = Phase::Final;
             let mut l4 = Local::default();
             shot("final", &s, &mut |b, s| studio::finale(b, a, s, true, 10.0, 0.0, &mut l4));
@@ -1327,54 +1355,44 @@ mod tests {
             save(&format!("go_{tag}"), &buf);
         }
         // One page with every screen, for a single scroll-through review.
-        let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().into_string().unwrap()).filter(|n| n != "gallery.html").collect();
+        let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().into_string().unwrap()).filter(|n| n.ends_with(".png")).collect();
         names.sort();
         let mut g = String::from("<!doctype html><meta charset=utf-8><body style='background:#111;color:#aaa;font:12px sans-serif'>");
         for n in names {
-            let body = std::fs::read_to_string(dir.join(&n)).unwrap();
-            let pre = &body[body.find("<pre").unwrap()..];
-            g.push_str(&format!("<h3>{n}</h3>{pre}"));
+            g.push_str(&format!("<h3>{n}</h3><img src='{n}' style='image-rendering:pixelated;max-width:100%'>"));
         }
         std::fs::write(dir.join("gallery.html"), g).unwrap();
     }
 
-    fn html(buf: &Buffer) -> String {
-        let hex = |c: ratatui::style::Color| {
-            let r = Rgb::from_color(c);
-            format!("#{:02x}{:02x}{:02x}", (r.0 * 255.0) as u8, (r.1 * 255.0) as u8, (r.2 * 255.0) as u8)
-        };
-        let px = (1180.0 / (buf.area.width as f32 * 0.6)).min(15.0);
-        let mut s = format!(
-            "<!doctype html><meta charset=utf-8><body style='background:#000;margin:4px'><pre style='font:{px:.1}px/1 \"Cascadia Mono\",Consolas,monospace;margin:0'>"
-        );
-        for y in 0..buf.area.height {
-            let mut run = (String::new(), String::new(), String::new());
-            for x in 0..buf.area.width {
-                let c = &buf[(x, y)];
-                let sym = match c.symbol() {
-                    "<" => "&lt;",
-                    ">" => "&gt;",
-                    "&" => "&amp;",
-                    other => other,
+    /// The frame as it looks: every cell is two pixels (a half block), any other glyph would
+    /// show as a red cell so it stands out.
+    fn png(buf: &Buffer) -> Vec<u8> {
+        const K: usize = 4;
+        let (w, h) = (buf.area.width as usize, buf.area.height as usize * 2);
+        let mut px = vec![0u8; w * K * h * K * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let c = &buf[(x as u16, (y / 2) as u16)];
+                let half = c.symbol() == "▀";
+                let rgb = match (half, y % 2) {
+                    (true, 0) => Rgb::from_color(c.fg),
+                    (_, _) if !half && c.symbol() != " " => Rgb(1.0, 0.0, 0.0),
+                    _ => Rgb::from_color(c.bg),
                 };
-                let (fg, bg) = (hex(c.fg), hex(c.bg));
-                if (fg.as_str(), bg.as_str()) != (run.0.as_str(), run.1.as_str()) {
-                    if !run.2.is_empty() {
-                        s.push_str(&format!("<span style='color:{};background:{}'>{}</span>", run.0, run.1, run.2));
+                let v = [rgb.0, rgb.1, rgb.2].map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8);
+                for dy in 0..K {
+                    for dx in 0..K {
+                        let i = ((y * K + dy) * w * K + x * K + dx) * 3;
+                        px[i..i + 3].copy_from_slice(&v);
                     }
-                    run = (fg, bg, String::new());
                 }
-                run.2.push_str(sym);
             }
-            s.push_str(&format!("<span style='color:{};background:{}'>{}</span>\n", run.0, run.1, run.2));
         }
-        s + "</pre>"
+        let mut out = vec![];
+        let mut e = png::Encoder::new(&mut out, (w * K) as u32, (h * K) as u32);
+        e.set_color(png::ColorType::Rgb);
+        e.write_header().unwrap().write_image_data(&px).unwrap();
+        out
     }
 
-    #[test]
-    fn wrap_respects_width() {
-        let lines = wrap("the quick brown fox jumps over the lazy dog", 12);
-        assert!(lines.iter().all(|l| l.len() <= 12));
-        assert_eq!(lines.join(" "), "the quick brown fox jumps over the lazy dog");
-    }
 }

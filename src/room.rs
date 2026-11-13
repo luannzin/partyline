@@ -9,19 +9,30 @@ use crate::gfx::{Canvas, Rgb, hash, pal};
 pub struct Shot {
     pub cv: Canvas,
     /// TV glass bounds in canvas pixels: x0, y0, x1, y1 (inclusive). Empty when out of view.
-    glass: (i32, i32, i32, i32),
+    pub glass: (i32, i32, i32, i32),
 }
 
-impl Shot {
-    /// The TV glass in terminal cells, rounded inward.
-    pub fn screen(&self, area: Rect) -> Rect {
-        let (x0, y0, x1, y1) = self.glass;
-        let (r0, r1) = ((y0 + 1) / 2, (y1 + 1) / 2);
-        if x1 <= x0 || r1 <= r0 {
-            return Rect::new(area.x, area.y, 0, 0);
-        }
-        Rect::new(area.x + x0 as u16, area.y + r0 as u16, (x1 - x0 + 1) as u16, (r1 - r0) as u16)
-    }
+/// Where the camera rests for the menu: the widest shot whose TV glass still has `w` x `h`
+/// canvas pixels for the menu. Small windows move the camera in along the dolly.
+pub fn rest(area: Rect, w: f32, h: f32) -> f32 {
+    let art = art::get();
+    let (cw, ch) = (area.width as f32, area.height as f32 * 2.0);
+    let (iw, ih) = (art.room_a.w as f32, art.frame_h as f32);
+    let s = (cw / iw).max(ch / ih);
+    let (ox, oy) = ((iw - cw / s) / 2.0, (ih - ch / s) / 2.0);
+    let last = art.frames - 1;
+    (0..=50)
+        .map(|i| i as f32 / 50.0)
+        .find(|&p| {
+            let f = p * last as f32;
+            let (i0, m) = (f.floor() as usize, f.fract());
+            let i1 = (i0 + 1).min(last);
+            let g = |k: usize| art.glass[i0][k] + (art.glass[i1][k] - art.glass[i0][k]) * m;
+            let gw = ((g(2) - ox) * s).min(cw) - ((g(0) - ox) * s).max(0.0);
+            let gh = ((g(3) - oy) * s).min(ch) - ((g(1) - oy) * s).max(0.0);
+            gw >= w && gh >= h
+        })
+        .unwrap_or(1.0)
 }
 
 /// `p`: 0 = the room shot from behind the couch, 1 = the glass fills the view.
@@ -98,10 +109,12 @@ mod tests {
     #[test]
     fn room_shot_frames_the_tv_and_dolly_fills_it() {
         let a = Rect::new(0, 0, 120, 36);
-        let sr = draw(a, 0.0, 1.0, pal::INK).screen(a);
-        assert!(sr.width > a.width / 4 && sr.width < a.width * 2 / 3, "TV glass is a big part of the room shot");
-        assert!(sr.x > a.x && sr.right() < a.right(), "and fully inside it");
-        let end = draw(a, 1.0, 1.0, pal::INK).screen(a);
-        assert_eq!((end.width, end.height), (a.width, a.height), "the dolly ends inside the glass");
+        let (x0, _, x1, _) = draw(a, 0.0, 1.0, pal::INK).glass;
+        assert!(x1 - x0 > 120 / 4 && x1 - x0 < 120 * 2 / 3, "TV glass is a big part of the room shot");
+        assert!(x0 > 0 && x1 < 119, "and fully inside it");
+        assert_eq!(draw(a, 1.0, 1.0, pal::INK).glass, (0, 0, 119, 71), "the dolly ends inside the glass");
+        let p = rest(Rect::new(0, 0, 80, 24), 60.0, 46.0);
+        assert!(p > 0.0 && p < 1.0, "a small window moves the camera in, not all the way");
+        assert_eq!(rest(Rect::new(0, 0, 240, 64), 60.0, 46.0), 0.0, "a big one keeps the wide shot");
     }
 }

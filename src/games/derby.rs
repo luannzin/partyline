@@ -4,7 +4,7 @@ use ratatui::buffer::Buffer;
 use serde::{Deserialize, Serialize};
 
 use super::{Fx, Local, View, stage};
-use crate::gfx::{Rgb, big_width, ctext, hash, pal, text};
+use crate::gfx::{LINE, Rgb, SMALL, big_width, fit_label, hash, label_width, pal, type_h};
 use crate::proto::{Event, Input, Pid};
 
 pub const LEN: usize = 16;
@@ -112,6 +112,11 @@ impl S {
         }
     }
 
+    /// Seconds left on the clock.
+    pub fn left(&self, now: u64) -> u64 {
+        (self.start + LIMIT).saturating_sub(now) / 1000
+    }
+
     pub fn render(&self, v: &View, l: &mut Local, buf: &mut Buffer) {
         let a = v.area;
         let mut cv = stage(a, v.t, 0.2);
@@ -127,10 +132,12 @@ impl S {
             }
         }
 
-        let lane_h = 6; // pixels = 3 rows: name, progress, gap
-        let top = 4;
-        let (x0, x1) = (16, cv.w - 6);
-        let mut names = vec![];
+        // Lanes with each racer's name in its color at the start line.
+        let lane_h = ((cv.h - 2 - 4 - type_h(7.0) - 2 - LINE) / (self.progress.len() as i32).max(1)).clamp(6, 7);
+        let top = 2;
+        let names: Vec<String> = self.progress.iter().map(|e| fit_label(&v.name(e.0), 28, 1)).collect();
+        let x0 = 8 + names.iter().map(|n| label_width(n, 1)).max().unwrap_or(0);
+        let x1 = cv.w - 6;
         for (i, &(p, n)) in self.progress.iter().enumerate() {
             let y = top + i as i32 * lane_h;
             let mine = p == v.me || p == v.cam;
@@ -161,49 +168,40 @@ impl S {
                     cv.blend(rx - k * 2, y + 1, c, 0.5 / k as f32);
                 }
             }
-            names.push((y / 2, v.name(p), c, n));
+            cv.label(4, y + (lane_h - SMALL) / 2, &names[i], c, 1);
         }
 
-        // Current word.
+        // Current word: what you have typed of it turns your color.
         let me_n = self.of(v.me);
         let me_racing = self.progress.iter().any(|e| e.0 == v.me);
         let who = if me_racing { v.me } else { v.cam };
         let idx = if who == v.me { l.word.max(me_n) as usize } else { self.of(who) as usize };
-        let word_y = top + self.progress.len() as i32 * lane_h + 6;
+        let word_y = top + self.progress.len() as i32 * lane_h + 4;
         let typo = v.t - l.typo_t < 0.18;
         let mut scale = 2;
+        let cx = cv.w / 2;
         if let Some(w) = self.words.get(idx) {
             let up = w.to_uppercase();
-            while scale > 1 && big_width(&up, scale) > cv.w - 4 {
+            while scale > 1 && (big_width(&up, scale) > cv.w - 4 || word_y + type_h((7 * scale) as f32) + 2 + LINE > cv.h) {
                 scale -= 1;
             }
             let jitter = if typo && !v.calm { ((v.t * 90.0).sin() * 2.0) as i32 } else { 0 };
-            let typed = if who == v.me { l.typed.len() } else { 0 };
-            let hc = v.hue(who);
-            let x = cv.w / 2 - big_width(&up, scale) / 2 + jitter;
-            let fill = move |lx: i32, _| {
-                if typo { pal::RED } else if (lx / (6 * scale)) < typed as i32 { hc } else { pal::INK }
-            };
-            cv.big(x, word_y, &up, scale, &fill);
+            let typed = if who == v.me { l.typed.len().min(up.len()) } else { 0 };
+            let x = cx - big_width(&up, scale) / 2 + jitter;
+            cv.big(x, word_y, &up, scale, &|_, _| if typo { pal::RED } else { pal::INK });
+            if !typo && typed > 0 {
+                let hc = v.hue(who);
+                cv.big(x, word_y, &up[..typed], scale, &|_, _| hc);
+            }
+        }
+        let row = word_y + type_h((7 * scale) as f32) + 2;
+        let preview: Vec<&str> = self.words.iter().skip(idx + 1).take(4).map(|s| s.as_str()).collect();
+        if let Some(place) = self.finished.iter().position(|&p| p == who) {
+            cv.heading(cx, row, &format!("FINISHED · PLACE {}", place + 1), pal::GOLD, cv.w - 8);
+        } else if !preview.is_empty() && row + SMALL < cv.h {
+            cv.label_center(cx, row, &fit_label(&format!("NEXT   {}", preview.join("  ")), cv.w - 8, 1), pal::DIM, 1);
         }
         cv.blit(buf, a);
-
-        for (row, name, c, n) in names {
-            text(buf, a, a.x as i32 + 1, a.y as i32 + row, &name, c);
-            text(buf, a, a.x as i32 + 1, a.y as i32 + row + 1, &format!("{n}/{LEN}"), pal::DIM);
-        }
-        let left = (self.start + LIMIT).saturating_sub(v.now) / 1000;
-        text(buf, a, a.right() as i32 - 6, a.y as i32, &format!("{left:>2}s"), if left < 10 { pal::RED } else { pal::DIM });
-        let preview: Vec<&str> = self.words.iter().skip(idx + 1).take(4).map(|s| s.as_str()).collect();
-        let row = a.y as i32 + (word_y + 7 * scale) / 2 + 2;
-        if let Some(place) = self.finished.iter().position(|&p| p == who) {
-            ctext(buf, a, row, &format!("FINISHED - PLACE {}", place + 1), pal::GOLD);
-        } else if !preview.is_empty() {
-            ctext(buf, a, row, &format!("next  {}", preview.join("  ")), pal::DIM);
-        }
-        if !me_racing {
-            ctext(buf, a, a.bottom() as i32 - 1, "spectating", pal::DIM);
-        }
     }
 }
 

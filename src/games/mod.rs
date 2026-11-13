@@ -10,7 +10,7 @@ use std::time::Instant;
 use ratatui::{buffer::Buffer, layout::Rect};
 use serde::{Deserialize, Serialize};
 
-use crate::gfx::{Canvas, Rgb, hue, pal};
+use crate::gfx::{Canvas, Hint, Rgb, hue, pal};
 use crate::proto::{Event, Input, Kind, Pid, Player};
 
 /// Points for 1st, 2nd, 3rd; everyone else scores 0.
@@ -88,6 +88,18 @@ impl Game {
             Game::Odd(s) => s.render(v, l, buf),
         }
     }
+    /// The game's own count for the score bar.
+    pub fn status(&self, now: u64) -> (String, Rgb) {
+        match self {
+            Game::Blink(s) => (format!("FLASH {}/{}", s.r() + 1, blink::FLASHES), pal::DIM),
+            Game::Grid(s) => (format!("{}/{} MOVING", s.bikes.iter().filter(|b| b.alive).count(), s.bikes.len()), pal::DIM),
+            Game::Derby(s) => {
+                let left = s.left(now);
+                (format!("{left} S LEFT"), if left < 10 { pal::RED } else { pal::DIM })
+            }
+            Game::Odd(s) => (format!("QUESTION {}/{}", s.round.min(odd::ROUNDS - 1) + 1, odd::ROUNDS), pal::DIM),
+        }
+    }
 }
 
 pub fn title(k: Kind) -> &'static str {
@@ -99,12 +111,13 @@ pub fn title(k: Kind) -> &'static str {
     }
 }
 
-pub fn howto(k: Kind) -> (&'static str, &'static str) {
+/// How to play, and the keys for it.
+pub fn howto(k: Kind) -> (&'static str, &'static [Hint<'static>]) {
     match k {
-        Kind::Blink => ("Wait for the flash, then hit it first. Too early and you're out.", "SPACE"),
-        Kind::Gridlock => ("Steer your light trail. Touch any trail or wall and you crash.", "ARROWS / WASD"),
-        Kind::Derby => ("Type each word to run. First across the line wins.", "TYPE"),
-        Kind::Odd => ("Pick the answer the fewest people pick. The minority scores.", "1  2  3"),
+        Kind::Blink => ("Wait for the flash, then hit it first. Too early and you're out.", &[("SPACE", "hit it")]),
+        Kind::Gridlock => ("Steer your light trail. Touch any trail or wall and you crash.", &[("↑↓←→", "steer"), ("WASD", "also steers")]),
+        Kind::Derby => ("Type each word to run. First across the line wins.", &[("A-Z", "type")]),
+        Kind::Odd => ("Pick the answer the fewest people pick. The minority scores.", &[("1 2 3", "pick")]),
     }
 }
 

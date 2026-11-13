@@ -3,7 +3,11 @@ use ratatui::buffer::Buffer;
 use serde::{Deserialize, Serialize};
 
 use super::{Fx, Local, View, panel, stage};
-use crate::gfx::{big_width, ctext, ease_out, hash, pal, prog, text};
+use crate::gfx::Canvas;
+use crate::gfx::{LINE, Rgb, SMALL, big_width, ease_out, fit_label, hash, label_width, pal, prog, type_h, wrap_label};
+
+/// A key or chip: the small face on a plate.
+const CHIP: i32 = SMALL + 2;
 use crate::proto::{Event, Input, Pid};
 
 pub const ROUNDS: u8 = 5;
@@ -18,7 +22,7 @@ const QS: &[(&str, [&str; 3])] = &[
     ("PET", ["CAT", "DOG", "DRAGON"]),
     ("TRAVEL BY", ["TRAIN", "PLANE", "ROCKET"]),
     ("SEASON", ["SUMMER", "WINTER", "AUTUMN"]),
-    ("MUSIC", ["ROCK", "FUNK", "ELECTRONIC"]),
+    ("MUSIC", ["ROCK", "FUNK", "TECHNO"]),
     ("A NUMBER", ["ONE", "TWO", "THREE"]),
     ("VILLAIN LAIR", ["VOLCANO", "MOON", "OFFICE"]),
     ("DESSERT", ["CAKE", "ICE CREAM", "FRUIT"]),
@@ -132,24 +136,73 @@ impl S {
         }
     }
 
+    /// Narrow screens: the question as a heading and the answers as rows, key, answer and (once
+    /// revealed) how many picked it; the clock runs along the bottom.
+    fn render_list(&self, v: &View, cv: &mut Canvas, my: Option<u8>, rt: f32) {
+        let (prompt, opts) = self.q();
+        let reveal = matches!(self.stage, Stage::Reveal { .. });
+        let (cx, rw) = (cv.w / 2, cv.w - 8);
+        cv.heading(cx, 2, prompt, pal::BULB, rw);
+        let pitch = ((cv.h - 4 - LINE - 4) / 3).clamp(CHIP + 1, 12);
+        for k in 0..3u8 {
+            let y = 2 + LINE + 3 + k as i32 * pitch;
+            let won = reveal && self.winners.contains(&k);
+            let lost = reveal && !self.winners.is_empty() && !won;
+            let mut face = pal::PANEL;
+            if my == Some(k) {
+                face = face.lerp(pal::GOLD, 0.18);
+            }
+            if lost {
+                face = face.mul(0.6);
+            }
+            if won {
+                cv.light(cx as f32, (y + pitch / 2) as f32, rw as f32 * 0.6, pal::GOLD, 0.3 * (0.8 + 0.2 * (v.t * 6.0).sin()) * (rt * 4.0).min(1.0));
+            }
+            cv.rect(4, y, rw, pitch - 1, face);
+            cv.rect(4, y, 2, pitch - 1, if my == Some(k) || won { pal::GOLD } else { pal::DIM.mul(0.6) });
+            let ty = y + (pitch - 1 - CHIP) / 2;
+            cv.chip(8, ty, &(k + 1).to_string(), pal::STAGE_DEEP, pal::INK.mul(0.78));
+            let mut right = 4 + rw - 3;
+            if reveal {
+                let n = self.picks.iter().filter(|p| p.1 == Some(k)).count();
+                let count = if won { format!("★ {n}") } else { n.to_string() };
+                right -= label_width(&count, 1);
+                cv.label(right, ty + 1, &count, if won { pal::GOLD } else { pal::DIM }, 1);
+                right -= 4;
+            }
+            cv.label(8 + CHIP + 4, ty + 1, &fit_label(opts[k as usize], right - (8 + CHIP + 4), 1), pal::INK, 1);
+        }
+        if let Stage::Pick { until } = self.stage {
+            let left = until.saturating_sub(v.now) as f32 / PICK_MS as f32;
+            cv.rect(4, cv.h - 2, ((cv.w - 8) as f32 * left) as i32, 1, if left < 0.3 { pal::RED } else { pal::GOLD });
+        }
+    }
+
     pub fn render(&self, v: &View, l: &mut Local, buf: &mut Buffer) {
         let a = v.area;
         let reveal = matches!(self.stage, Stage::Reveal { .. });
         let mut cv = stage(a, v.t, if reveal { 0.6 } else { 0.1 });
         let (prompt, opts) = self.q();
-        let mut scale = 2;
+        let my = self.picks.iter().find(|p| p.0 == v.me).and_then(|p| p.1);
+        let rt = v.t - l.reveal_t;
+        if (cv.w - 6) / 3 < 34 {
+            self.render_list(v, &mut cv, my, rt);
+            return cv.blit(buf, a);
+        }
+        let mut scale = if cv.h >= 80 { 2 } else { 1 };
         while scale > 1 && big_width(prompt, scale) > cv.w - 4 {
             scale -= 1;
         }
         let cx = cv.w / 2;
-        cv.big_center(cx, 5, prompt, scale, &|_, y| pal::BULB.lerp(pal::ORANGE, y as f32 / 14.0));
+        cv.big_center(cx, 3, prompt, scale, &|_, y| pal::BULB.lerp(pal::ORANGE, y as f32 / (7 * scale) as f32));
 
-        let my = self.picks.iter().find(|p| p.0 == v.me).and_then(|p| p.1);
-        let (cw, top) = (((a.width as i32 - 8) / 3).min(30), 5 + 7 * scale + 8);
-        let ph = (cv.h - top - 14).clamp(14, 44);
+        // Under the cards: the clock, then one row (two when tall) of who has locked in, how to
+        // pick, or who scored.
+        let rows = if cv.h >= 80 { 2 } else { 1 };
+        let (cw, top) = (((cv.w - 6) / 3).min(44), 3 + type_h((7 * scale) as f32) + 3);
+        let foot = cv.h - 1 - rows * (CHIP + 3);
+        let ph = (foot - 3 - top).min(52);
         let x0 = (cv.w - (cw * 3 + 4)) / 2;
-        let rt = v.t - l.reveal_t;
-        let mut labels = vec![];
         for k in 0..3u8 {
             let x = x0 + k as i32 * (cw + 2);
             let won = reveal && self.winners.contains(&k);
@@ -165,52 +218,75 @@ impl S {
             if won {
                 cv.light((x + cw / 2) as f32, (top + ph / 2) as f32, cw as f32, pal::GOLD, 0.35 * (0.8 + 0.2 * (v.t * 6.0).sin()));
             }
-            panel(&mut cv, x, top - lift, cw, ph, face, if my == Some(k) || won { pal::GOLD } else { pal::DIM.mul(0.6) });
+            let (y, cx) = (top - lift, x + cw / 2);
+            panel(&mut cv, x, y, cw, ph, face, if my == Some(k) || won { pal::GOLD } else { pal::DIM.mul(0.6) });
+            // The key (and once revealed how many picked it), the answer, then who picked it
+            // as far as the card has room.
+            cv.chip(x + 3, y + 4, &(k + 1).to_string(), pal::STAGE_DEEP, pal::INK.mul(0.78));
             let pickers: Vec<Pid> = self.picks.iter().filter(|p| p.1 == Some(k)).map(|p| p.0).collect();
-            labels.push((x, (top - lift) / 2, k, won, pickers));
-        }
-        cv.blit(buf, a);
-
-        for (x, row, k, won, pickers) in labels {
-            let (ax, ay) = (a.x as i32 + x, a.y as i32 + row);
-            text(buf, a, ax + 2, ay + 1, &format!("[{}]", k + 1), pal::GOLD);
-            let opt = opts[k as usize];
-            text(buf, a, ax + (cw - opt.len() as i32) / 2, ay + 3, opt, pal::INK);
             if reveal {
-                let n = pickers.len();
-                text(buf, a, ax + (cw - 9) / 2, ay + 5, &format!("{n} picked"), if won { pal::GOLD } else { pal::DIM });
+                let count = if won { format!("★ {}", pickers.len()) } else { pickers.len().to_string() };
+                cv.label(x + cw - 3 - label_width(&count, 1), y + 5, &count, if won { pal::GOLD } else { pal::DIM }, 1);
+            }
+            let mut ly = y + 4 + CHIP + 2;
+            for line in wrap_label(opts[k as usize], cw - 4) {
+                cv.label_center(cx, ly, &fit_label(&line, cw - 2, 1), pal::INK, 1);
+                ly += LINE;
+            }
+            if reveal {
+                ly += 1;
                 for (i, p) in pickers.iter().enumerate() {
-                    if rt > 0.25 + i as f32 * 0.07 {
-                        text(buf, a, ax + 2, ay + 7 + i as i32, &v.name(*p), v.hue(*p));
+                    if ly + SMALL > y + ph - 2 {
+                        break;
                     }
-                }
-                if won {
-                    text(buf, a, ax + (cw - 9) / 2, ay + ph / 2 - 2, "ODD WINS!", pal::GOLD);
+                    if rt > 0.25 + i as f32 * 0.07 {
+                        cv.label_center(cx, ly, &fit_label(&v.name(*p), cw - 6, 1), v.hue(*p), 1);
+                    }
+                    ly += LINE;
                 }
             }
         }
 
-        let status = a.bottom() as i32 - 3;
+        let cx = cv.w / 2;
+        let row = foot + 3;
+        let ask = my.is_none() && self.picks.iter().any(|p| p.0 == v.me);
         match self.stage {
             Stage::Pick { until } => {
                 let left = until.saturating_sub(v.now) as f32 / PICK_MS as f32;
-                let w = ((a.width as f32 - 8.0) * left) as usize;
                 let c = if left < 0.3 { pal::RED } else { pal::GOLD };
-                text(buf, a, a.x as i32 + 4, status, &"━".repeat(w), c);
-                let locked: Vec<String> =
-                    self.picks.iter().map(|(p, k)| format!("{}{}", v.name(*p), if k.is_some() { " ✓" } else { " …" })).collect();
-                ctext(buf, a, status + 1, &locked.join("   "), pal::DIM);
-                if my.is_none() && self.picks.iter().any(|p| p.0 == v.me) {
-                    ctext(buf, a, status + 2, "press 1, 2 or 3 - your pick locks in", pal::INK);
+                cv.rect(4, foot, ((cv.w - 8) as f32 * left) as i32, 1, c);
+                if !ask || rows == 2 {
+                    let n = self.picks.len() as i32;
+                    let mut x = cx - (n * 8 - 3) / 2;
+                    for (p, k) in &self.picks {
+                        let c = v.hue(*p);
+                        cv.rect(x, row + 1, 5, 5, if k.is_some() { c } else { c.mul(0.25) });
+                        x += 8;
+                    }
+                }
+                if ask {
+                    cv.keys(cx, foot + rows * (CHIP + 3) - CHIP, cv.w - 8, &[("1 2 3", "pick · it locks in")], v.t);
                 }
             }
-            Stage::Reveal { .. } if self.winners.is_empty() => ctext(buf, a, status + 1, "Everyone agreed. No points.", pal::DIM),
+            Stage::Reveal { .. } if self.winners.is_empty() => cv.label_center(cx, row + 1, "EVERYONE AGREED · NO POINTS", pal::DIM, 1),
             Stage::Reveal { .. } => {
-                let pts: Vec<String> = self.points.iter().map(|(p, n)| format!("{} {n}", v.name(*p))).collect();
-                ctext(buf, a, status + 1, &pts.join("   "), pal::DIM);
+                // Points so far in this game, as many chips as fit.
+                let chips: Vec<(String, Rgb)> = self.points.iter().map(|(p, n)| (format!("{} {n}", fit_label(&v.name(*p), 24, 1)), v.hue(*p))).collect();
+                let (mut n, mut w) = (0, -3);
+                for (s, _) in &chips {
+                    let cw = label_width(s, 1) + 7;
+                    if w + cw > cv.w - 8 {
+                        break;
+                    }
+                    (n, w) = (n + 1, w + cw);
+                }
+                let mut x = cx - w / 2;
+                for (s, c) in &chips[..n] {
+                    x += cv.chip(x, row, s, pal::STAGE_DEEP, *c) + 3;
+                }
             }
         }
-        ctext(buf, a, a.y as i32, &format!("QUESTION {} OF {ROUNDS}", self.round.min(ROUNDS - 1) + 1), pal::DIM);
+        cv.blit(buf, a);
     }
 }
 

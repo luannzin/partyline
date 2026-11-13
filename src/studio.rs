@@ -1,14 +1,19 @@
 //! Inside the TV: the test chamber. Contestants seated in the lobby, title cards, countdown,
-//! results board and the champion's crate.
+//! results board, the champion's crate, and what sits over a game (score bar, camera, GO!).
+//! Every word is pixels in one of the two faces in `gfx`.
 use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::art::{self, EMPTY_CHAIR};
 use crate::games::{self, Local, stage};
-use crate::gfx::{Canvas, Rgb, big_width, ctext, ease_out, hash, hue, keycap, keys, pal, prog, spaced, text, text_bg};
+use crate::gfx::{Canvas, Hint, LINE, Rgb, SMALL, big_width, ease_out, fit_label, hash, hue, label_width, pal, pick_label, prog, type_h, wrap_label};
 use crate::proto::{Kind, Link, Pid, Player, Session};
 
 /// Where the feet touch the floor in a contestant sprite, as a fraction of its height.
 const FEET: f32 = 0.9;
+/// Rows the score bar takes at the top during play.
+pub const HUD_ROWS: u16 = 4;
+/// A chip or keycap: the small face on a plate.
+const CHIP: i32 = SMALL + 2;
 
 /// Stencil paint: bone white fading to hazard amber, with a slow highlight sweep.
 fn shimmer(lx: i32, ly: i32, h: i32, t: f32, w: i32) -> Rgb {
@@ -25,13 +30,15 @@ fn fit_scale(s: &str, max: i32, width: i32) -> i32 {
     k
 }
 
-fn link_badge(p: &Player) -> (String, Rgb) {
+/// How a player is connected, longest wording first.
+fn link_badge(p: &Player) -> (Vec<String>, Rgb) {
+    let ms = |k: &str, c| (vec![format!("{k} {}MS", p.ping), format!("{k} {}", p.ping), k.to_string()], c);
     match p.link {
-        Link::Host => ("HOST".into(), pal::GOLD),
-        Link::Bot => ("BOT".into(), pal::DIM),
-        Link::Lan => (format!("LAN {}ms", p.ping), pal::GREEN),
-        Link::Direct => (format!("NET {}ms", p.ping), pal::GREEN),
-        Link::Relay => (format!("RELAY {}ms", p.ping), pal::ORANGE),
+        Link::Host => (vec!["HOST".into()], pal::GOLD),
+        Link::Bot => (vec!["BOT".into()], pal::DIM),
+        Link::Lan => ms("LAN", pal::GREEN),
+        Link::Direct => ms("NET", pal::GREEN),
+        Link::Relay => ms("RELAY", pal::ORANGE),
     }
 }
 
@@ -53,90 +60,105 @@ fn seat(cv: &mut Canvas, i: usize, cx: f32, feet: f32, h: f32, k: f32) -> f32 {
     top
 }
 
-/// Lobby: logo, room line, contestants dropping into their chairs, audience and controls.
+/// Lobby: the room's name (under the logo when there is height for it), contestants dropping
+/// into their chairs under their nameplates, who is ready, and the key hints, which carry the
+/// counts.
 pub fn lobby(buf: &mut Buffer, a: Rect, s: &Session, me: Pid, host: bool, t: f32, appear: &[(Pid, f32)]) {
     let mut cv = stage(a, t, 0.45);
-    let scale = if a.width >= 118 && a.height >= 48 { 2 } else { 1 };
-    let logo = "PARTYLINE";
-    let lw = big_width(logo, scale);
-    let lh = 7 * scale;
-    cv.big_center(cv.w / 2, 4, logo, scale, &|x, y| shimmer(x, y, lh, t, lw));
-
-    let room_row = a.y as i32 + (4 + lh) / 2 + 2;
-    let bottom = a.bottom() as i32 - 2;
-    let feet_row = bottom - 4;
-    let feet = ((feet_row - a.y as i32) * 2) as f32;
-    let top = ((room_row + 3 - a.y as i32) * 2) as f32;
-
+    let (w, h, cx) = (cv.w, cv.h, cv.w / 2);
     let players: Vec<&Player> = s.players.iter().filter(|p| !p.spectator).collect();
     let seats = players.len().clamp(4, 8);
-    let slot = ((cv.w - 6) as f32 / seats as f32).min(40.0);
-    let h = ((feet - top) / FEET).min(slot * 2.3).max(12.0);
-    let x0 = cv.w as f32 / 2.0 - slot * (seats as f32 - 1.0) / 2.0;
-    let mut labels = vec![];
+    let slot = ((w - 6) as f32 / seats as f32).min(40.0);
+    let x0 = w as f32 / 2.0 - slot * (seats as f32 - 1.0) / 2.0;
+
+    let mut y = 3;
+    if h >= 80 {
+        let scale = if w >= 118 && h >= 96 { 2 } else { 1 };
+        let (lw, lh) = (big_width("PARTYLINE", scale), 7 * scale);
+        cv.big_center(cx, y, "PARTYLINE", scale, &|x, yy| shimmer(x, yy, lh, t, lw));
+        y += type_h(lh as f32) + 3;
+    }
+    cv.heading(cx, y, &s.room.to_uppercase(), pal::GOLD, w - 8);
+    y += SMALL + 4;
+
+    // Nameplates wider than a seat take turns high and low.
+    let names: Vec<String> = players.iter().map(|p| p.name.to_uppercase()).collect();
+    let crowded = names.iter().any(|n| label_width(n, 1) + 4 > slot as i32 - 2);
+    let plate_max = if crowded { (2.0 * slot) as i32 - 4 } else { slot as i32 - 2 };
+    let plates = if crowded { 2 * (CHIP + 1) } else { CHIP + 1 };
+
+    // From the bottom: key hints, connection badges when there is room, then the floor. The
+    // READY chip sits on each contestant's feet.
+    let keys_y = h - 2 - CHIP;
+    let badges = h >= 72 && slot >= 30.0;
+    let badge_y = keys_y - 4 - SMALL;
+    let feet = (if badges { badge_y - 3 } else { keys_y - 4 }) as f32;
+    let chip_y = feet as i32 - CHIP + 1;
+    let top = (y + plates) as f32;
+    let sh = ((feet - top) / FEET).min(slot * 2.3).max(10.0);
+
+    let mut tags = vec![];
     for i in 0..seats {
-        let cx = x0 + i as f32 * slot;
+        let scx = x0 + i as f32 * slot;
         let Some(p) = players.get(i) else {
-            let y = seat(&mut cv, EMPTY_CHAIR, cx, feet, h, 0.55);
-            labels.push((cx, y, None));
+            let top = seat(&mut cv, EMPTY_CHAIR, scx, feet, sh, 0.55);
+            tags.push((scx, top, i, None));
             continue;
         };
         let t0 = appear.iter().find(|e| e.0 == p.id).map(|e| e.1).unwrap_or(0.0) + i as f32 * 0.06;
         let drop = (1.0 - ease_out(prog(t, t0, 0.4))) * feet;
         if p.ready {
-            cv.light(cx, feet, slot * 0.6, pal::GREEN, 0.22);
+            cv.light(scx, feet, slot * 0.6, pal::GREEN, 0.22);
         }
         if p.id == me {
-            cv.light(cx, feet - h * 0.75, slot * 0.7, pal::BULB, 0.16);
+            cv.light(scx, feet - sh * 0.75, slot * 0.7, pal::BULB, 0.16);
         }
-        let y = seat(&mut cv, p.hue as usize % 8, cx, feet - drop, h, 1.25);
-        labels.push((cx, y, Some(*p)));
+        let top = seat(&mut cv, p.hue as usize % 8, scx, feet - drop, sh, 1.25);
+        tags.push((scx, top, i, Some(*p)));
     }
-    // Floor shadow under the status and key rows.
-    cv.band((bottom - 2 - a.y as i32) * 2, cv.h, pal::BLACK, 0.6);
-    cv.blit(buf, a);
+    // Floor shadow under the chips and key hints.
+    cv.band(feet as i32 + 1, h, pal::BLACK, 0.65);
 
-    ctext(buf, a, room_row, &spaced(&s.room.to_uppercase()), pal::INK.lerp(pal::DIM, 0.35));
-    let w = slot as usize;
-    let at = |cx: f32, s: &str| a.x as i32 + cx as i32 - s.chars().count() as i32 / 2;
-    for (cx, y, p) in labels {
-        let row = a.y as i32 + (y as i32) / 2 - 1;
-        match p {
-            None => text(buf, a, at(cx, "OPEN"), row + 2, "OPEN", pal::DIM),
-            Some(p) => {
-                // Nameplates: your own lit in your color, everyone else's name in theirs.
-                let name: String = p.name.to_uppercase().chars().take(w.saturating_sub(4).max(4)).collect();
-                let plate = format!(" {name} ");
-                let (fg, bg) = if p.id == me { (pal::STAGE_DEEP, hue(p.hue)) } else { (hue(p.hue), pal::PANEL) };
-                text_bg(buf, a, at(cx, &plate), row, &plate, fg, bg);
-                let (badge, bc) = link_badge(p);
-                let badge: String = badge.chars().take(w.saturating_sub(1).max(4)).collect();
-                text(buf, a, at(cx, &badge), feet_row + 1, &badge, bc);
-                if p.ready {
-                    text_bg(buf, a, at(cx, " READY "), feet_row + 2, " READY ", pal::STAGE_DEEP, pal::GREEN);
-                } else {
-                    text(buf, a, at(cx, "not ready"), feet_row + 2, "not ready", pal::DIM);
-                }
-            }
+    for (scx, top, i, p) in tags {
+        let sx = scx as i32;
+        let lift = if crowded && i % 2 == 1 { CHIP + 1 } else { 0 };
+        let py = top as i32 - CHIP - 1 - lift;
+        let Some(p) = p else {
+            cv.label_center(sx, py + 2, "OPEN", pal::DIM, 1);
+            continue;
+        };
+        // Your nameplate is lit in your color; everyone else's name is in theirs.
+        let name = fit_label(&p.name.to_uppercase(), plate_max - 4, 1);
+        let (fg, bg) = if p.id == me { (pal::STAGE_DEEP, hue(p.hue)) } else { (hue(p.hue), pal::PANEL) };
+        cv.chip_center(sx, py, &name, fg, bg);
+        if p.ready {
+            cv.chip_center(sx, chip_y, if slot >= 25.0 { "READY" } else { "✓" }, pal::STAGE_DEEP, pal::GREEN);
+        }
+        if badges {
+            let (b, c) = link_badge(p);
+            cv.label_center(sx, badge_y, &pick_label(&b, slot as i32 - 2), c, 1);
         }
     }
 
-    let audience: Vec<String> = s.players.iter().filter(|p| p.spectator).map(|p| p.name.to_uppercase()).collect();
-    let ready = players.iter().filter(|p| p.ready).count();
-    if !audience.is_empty() {
-        ctext(buf, a, bottom - 1, &format!("WATCHING  {}", audience.join(" · ")), pal::DIM);
-    }
-    let mut status = format!("{ready}/{} READY   ·   {} ROUNDS", players.len(), s.rounds);
-    if !host {
-        status.push_str("   ·   THE HOST STARTS THE SHOW");
-    }
-    ctext(buf, a, bottom, &status, pal::GOLD);
-    let hints: &[(&str, &str)] = if host {
-        &[("ENTER", "start"), ("SPACE", "ready"), ("←→", "rounds"), ("C", "copy invite"), ("S", "sit out"), ("ESC", "leave")]
-    } else {
-        &[("SPACE", "ready"), ("C", "copy invite"), ("S", "sit out"), ("ESC", "leave")]
+    let ready = format!("ready {}/{}", players.iter().filter(|p| p.ready).count(), players.len());
+    let rounds = format!("{} rounds", s.rounds);
+    let guest = format!("{} rounds · the host starts", s.rounds);
+    let watching: Vec<String> = s.players.iter().filter(|p| p.spectator).map(|p| p.name.to_uppercase()).collect();
+    let watch = match watching.len() {
+        0 => String::new(),
+        1 => format!("{} is watching", watching[0]),
+        n => format!("{n} watching"),
     };
-    keys(buf, a, bottom + 1, hints);
+    let mut hints: Vec<Hint> = if host {
+        vec![("ENTER", "start"), ("SPACE", ready.as_str()), ("←→", rounds.as_str()), ("C", "copy invite"), ("S", "sit out"), ("ESC", "leave")]
+    } else {
+        vec![("SPACE", ready.as_str()), ("", guest.as_str()), ("C", "copy invite"), ("S", "sit out"), ("ESC", "leave")]
+    };
+    if !watch.is_empty() {
+        hints.push(("", watch.as_str()));
+    }
+    cv.keys(cx, keys_y, w - 8, &hints, t);
+    cv.blit(buf, a);
 }
 
 /// Round title card, then a 3-2-1 countdown that breaks the grid.
@@ -144,51 +166,86 @@ pub fn intro(buf: &mut Buffer, a: Rect, s: &Session, kind: Kind, go_at: u64, now
     let left = go_at.saturating_sub(now);
     let counting = left <= 3000;
     let mut cv = stage(a, t, if counting { 0.6 } else { 0.35 });
+    let cx = cv.w / 2;
     let title = games::title(kind);
-    let scale = fit_scale(title, 4, cv.w);
+    let (line, hints) = games::howto(kind);
+    let mut lines = wrap_label(line, (cv.w - 8).min(180));
+    // The card, top down: the round, the title, then the rules and keys (or, counting down,
+    // the digit, at least 14 px, and the rules). Until it fits, the title shrinks, then the
+    // keys go, then the round (the score bar shows it in play), then the rules.
+    let rules = |n: usize| n as i32 * LINE;
+    let below = |n: usize, keys: bool| if counting { 4 + 16 + 4 + rules(n) } else { 5 + rules(n) + if keys { 4 + CHIP } else { 0 } };
+    let block = |scale: i32, n: usize, keys: bool, round: bool| if round { LINE + 2 } else { 0 } + type_h((7 * scale) as f32) + below(n, keys);
+    let fits = |scale, n, keys, round| block(scale, n, keys, round) + 3 <= cv.h;
+    let (mut keys, mut round) = (true, true);
+    let mut scale = fit_scale(title, 4, cv.w);
+    while scale > 1 && !fits(scale, lines.len(), keys, round) {
+        scale -= 1;
+    }
+    keys = fits(scale, lines.len(), keys, round);
+    round = fits(scale, lines.len(), keys, round);
+    if !fits(scale, lines.len(), keys, round) {
+        lines.clear();
+        round = fits(scale, 0, keys, true);
+    }
     let shown = ((t - since) / 0.035).max(0.0) as usize;
     let partial: String = title.chars().take(shown).collect();
     let tw = big_width(title, scale);
     let th = 7 * scale;
-    let ty = if counting { 6 } else { cv.h / 2 - th };
-    cv.big(cv.w / 2 - tw / 2 + scale, ty + scale, &partial, scale, &|_, _| pal::BLACK);
-    cv.big(cv.w / 2 - tw / 2, ty, &partial, scale, &|x, y| shimmer(x, y, th, t, tw));
+    let lead = if round { LINE + 2 } else { 0 };
+    let ty = if counting { 2 + lead } else { ((cv.h - block(scale, lines.len(), keys, round)) / 2).max(2) + lead };
+    if round {
+        cv.heading(cx, ty - LINE - 2, &format!("ROUND {} OF {}", s.round + 1, s.rounds), pal::GOLD, cv.w - 8);
+    }
+    cv.big(cx - tw / 2 + scale, ty + scale, &partial, scale, &|_, _| pal::BLACK);
+    cv.big(cx - tw / 2, ty, &partial, scale, &|x, y| shimmer(x, y, th, t, tw));
     if counting {
+        let foot = cv.h - 2 - rules(lines.len());
         let n = left.div_ceil(1000).max(1);
         let into = 1.0 - (left % 1000) as f32 / 1000.0;
-        let digit = n.to_string();
-        let max = ((cv.h - ty - th - 6) / 7).clamp(2, 9);
+        let max = ((foot - ty - th - 10) / 7).clamp(2, 9);
         let k = if into < 0.12 { max } else { (max - 1).max(2) };
         let c = pal::INK.lerp(pal::RED, into * 1.3);
-        let cx = cv.w / 2;
         let cy = ty + th + 4 + ((max - k) * 7) / 2;
         cv.light(cx as f32, (cy + k * 3) as f32, (k * 8) as f32, pal::BULB, 0.22 * (1.0 - into));
-        cv.big_center(cx, cy, &digit, k, &|_, _| c);
+        cv.big_center(cx, cy, &n.to_string(), k, &|_, _| c);
+        for (i, l) in lines.iter().enumerate() {
+            cv.label_center(cx, foot + i as i32 * LINE, l, pal::DIM, 1);
+        }
+    } else {
+        let mut y = ty + type_h(th as f32) + 5;
+        for l in &lines {
+            cv.label_center(cx, y, l, pal::INK, 1);
+            y += LINE;
+        }
+        if keys {
+            cv.keys(cx, y + 4, cv.w - 8, hints, t);
+        }
     }
     cv.blit(buf, a);
-    let (line, keys) = games::howto(kind);
-    let row = a.y as i32 + (ty + th) / 2 + 2;
-    ctext(buf, a, a.y as i32 + ty / 2 - 2, &spaced(&format!("ROUND {} OF {}", s.round + 1, s.rounds)), pal::GOLD);
-    if !counting {
-        ctext(buf, a, row, line, pal::INK);
-        let pill = format!("  {keys}  ");
-        let x = a.x as i32 + (a.width as i32 - pill.chars().count() as i32) / 2;
-        text_bg(buf, a, x, row + 2, &pill, pal::STAGE_DEEP, pal::INK);
-    } else {
-        ctext(buf, a, a.bottom() as i32 - 3, line, pal::DIM);
-    }
 }
 
-/// Per-round results: rows slide in, totals count up like a mechanical counter.
-pub fn results(buf: &mut Buffer, a: Rect, s: &Session, kind: Kind, gains: &[(Pid, u32)], until: u64, now: u64, t: f32, since: f32) {
+/// Per-round results: rows slide in, totals count up like a mechanical counter. A crowd
+/// splits into two columns.
+pub fn results(buf: &mut Buffer, a: Rect, s: &Session, gains: &[(Pid, u32)], until: u64, now: u64, t: f32, since: f32) {
     let mut cv = stage(a, t, 0.3);
+    let (w, h, cx) = (cv.w, cv.h, cv.w / 2);
     let head = "RESULTS";
-    let scale = fit_scale(head, 2, cv.w);
-    cv.big_center(cv.w / 2, 4, head, scale, &|x, y| shimmer(x, y, 7 * scale, t, big_width(head, scale)));
-    let top = 4 + 7 * scale + 6;
-    let rw = (a.width as i32 - 10).min(60);
-    let x0 = (cv.w - rw) / 2;
-    let mut rows = vec![];
+    let scale = if h >= 70 { fit_scale(head, 2, w) } else { 1 };
+    cv.big_center(cx, 2, head, scale, &|x, y| shimmer(x, y, 7 * scale, t, big_width(head, scale)));
+    let top = 2 + type_h((7 * scale) as f32) + 3;
+    // From the bottom: the clock bar, then "up next" when the rows leave room for it. One
+    // column if the rows fit (with the note if they can), else two.
+    let bar_y = h - 3;
+    let note_y = bar_y - 2 - LINE;
+    let n = gains.len() as i32;
+    let rows_fit = |cols: i32, foot: i32| (n + cols - 1) / cols * 7 <= foot - top;
+    let (cols, note) = [(1, true), (1, false), (2, true), (2, false)].into_iter().find(|&(c, nt)| rows_fit(c, if nt { note_y - 2 } else { bar_y - 2 })).unwrap_or((2, false));
+    let foot = if note { note_y - 2 } else { bar_y - 2 };
+    let per = (n + cols - 1) / cols;
+    let pitch = ((foot - top) / per.max(1)).clamp(7, 10);
+    let cw = if cols == 1 { (w - 12).min(110) } else { ((w - 14) / 2).min(80) };
+    let gx = (w - (cw * cols + 4 * (cols - 1))) / 2;
     let leader = s.players.iter().map(|p| p.score).max().unwrap_or(0);
     for (i, &(p, g)) in gains.iter().enumerate() {
         let d = since + 0.25 + i as f32 * 0.09;
@@ -196,37 +253,54 @@ pub fn results(buf: &mut Buffer, a: Rect, s: &Session, kind: Kind, gains: &[(Pid
         if k <= 0.0 {
             continue;
         }
-        let slide = ((1.0 - k) * 10.0) as i32;
-        let y = top + i as i32 * 6;
+        let (col, row) = (i as i32 / per, i as i32 % per);
+        let x = gx + col * (cw + 4) + ((1.0 - k) * 10.0) as i32;
+        let y = top + row * pitch;
+        let rh = pitch - 1;
         let pl = s.player(p);
         let c = pl.map(|p| hue(p.hue)).unwrap_or(pal::DIM);
-        cv.rect(x0 + slide, y, rw, 5, pal::PANEL.lerp(c, if i == 0 { 0.25 } else { 0.08 }));
-        cv.rect(x0 + slide, y, 2, 5, c);
-        cv.rect(x0 + slide, y + 4, rw, 1, pal::BLACK);
+        cv.rect(x, y, cw, rh, pal::PANEL.lerp(c, if i == 0 { 0.25 } else { 0.08 }));
+        cv.rect(x, y, 2, rh, c);
+        cv.rect(x, y + rh - 1, cw, 1, pal::BLACK.lerp(pal::PANEL, 0.3));
+        let ty = y + (rh - 1 - SMALL) / 2;
+        let place = match (cols, i) {
+            (2, _) => (i + 1).to_string(),
+            (_, 0) => "1ST".to_string(),
+            (_, 1) => "2ND".into(),
+            (_, 2) => "3RD".into(),
+            _ => format!("{}TH", i + 1),
+        };
+        cv.label(x + 5, ty, &place, if i == 0 { pal::GOLD } else { pal::DIM }, 1);
+        // Right to left: the leader's star, the running total (tabular digits), the gain.
         let total = pl.map(|p| p.score).unwrap_or(0);
         let counted = total - g + (g as f32 * ease_out(prog(t, d + 0.35, 0.6))) as u32;
-        rows.push((x0 + slide, y / 2, i, pl.map(|p| p.name.to_uppercase()).unwrap_or("GONE".into()), g, counted, total == leader && leader > 0));
-    }
-    cv.blit(buf, a);
-    for (x, row, i, name, g, counted, lead) in rows {
-        let ax = a.x as i32 + x;
-        let ay = a.y as i32 + row;
-        let place = ["1ST", "2ND", "3RD"].get(i).copied().map(String::from).unwrap_or(format!("{}TH", i + 1));
-        text(buf, a, ax + 4, ay + 1, &place, if i == 0 { pal::GOLD } else { pal::DIM });
-        text(buf, a, ax + 10, ay + 1, &name, pal::INK);
-        if g > 0 {
-            text(buf, a, ax + rw - 18, ay + 1, &format!("+{g}"), pal::GOLD);
+        let mut rx = x + cw - 4;
+        if total == leader && leader > 0 {
+            rx -= 5;
+            cv.label(rx, ty, "★", pal::GOLD, 1);
+            rx -= 4;
         }
-        text(buf, a, ax + rw - 10, ay + 1, &format!("{counted:>3} PTS"), pal::INK);
-        if lead {
-            text(buf, a, ax + rw - 2, ay + 1, "★", pal::GOLD);
+        // A narrow row keeps the name over the gain and the "PTS".
+        let pts = if cw >= 90 { format!("{counted} PTS") } else { counted.to_string() };
+        rx -= label_width(&pts, 1);
+        cv.label(rx, ty, &pts, pal::INK, 1);
+        if g > 0 && cw >= 80 {
+            let gain = format!("+{g}");
+            rx -= label_width(&gain, 1) + 5;
+            cv.label(rx, ty, &gain, pal::GOLD, 1);
         }
+        let nx = x + 5 + label_width(if cols == 2 { "8" } else { "8TH" }, 1) + 5;
+        let name = pl.map(|p| p.name.to_uppercase()).unwrap_or("GONE".into());
+        cv.label(nx, ty, &fit_label(&name, rx - 5 - nx, 1), pal::INK, 1);
     }
     let leftf = (until.saturating_sub(now) as f32 / 5600.0).min(1.0);
-    let next = if s.round + 1 < s.rounds { "NEXT ROUND" } else { "THE FINAL SCORES" };
-    let bar = ((a.width as f32 - 20.0) * leftf) as usize;
-    ctext(buf, a, a.bottom() as i32 - 4, &spaced(&format!("{} · {}", games::title(kind), next)), pal::DIM);
-    ctext(buf, a, a.bottom() as i32 - 3, &"━".repeat(bar), pal::GOLD);
+    if note {
+        let next = if s.round + 1 < s.rounds { format!("UP NEXT · ROUND {}", s.round + 2) } else { "UP NEXT · THE FINAL SCORES".into() };
+        cv.heading(cx, note_y, &next, pal::DIM, w - 8);
+    }
+    let bw = ((w - 20) as f32 * leftf) as i32;
+    cv.rect(cx - bw / 2, bar_y, bw, 1, pal::GOLD);
+    cv.blit(buf, a);
 }
 
 /// The champion on the tallest crate, with confetti.
@@ -238,109 +312,131 @@ pub fn finale(buf: &mut Buffer, a: Rect, s: &Session, host: bool, t: f32, since:
         cv.blit(buf, a);
         return;
     };
+    let (w, h, cx) = (cv.w, cv.h, cv.w / 2);
     let cc = hue(champ.hue);
-    let floor = cv.h - 7;
-    let sprite_h = (cv.h as f32 * 0.36).max(14.0);
-    let tall = (cv.h as f32 * 0.16) as i32;
+    // From the bottom: key hints, everyone's score on chips when there is room, the floor.
+    let keys_y = h - 2 - CHIP;
+    let board = h >= 70;
+    let board_y = keys_y - 3 - CHIP;
+    let floor = if board { board_y - 4 } else { keys_y - 4 };
     let name = champ.name.to_uppercase();
-    let name_y = 7;
-    let room = floor - tall - (sprite_h * FEET) as i32 - 4 - name_y;
-    let scale = fit_scale(&name, (room / 7).clamp(1, 4), cv.w);
+    cv.heading(cx, 2, "TONIGHT'S CHAMPION", pal::GOLD, w - 8);
+    let name_y = 2 + LINE + 3;
+    // The name is as big as it can be while the crates and contestants still stand under it.
+    let tall = (h as f32 * 0.12) as i32;
+    let stand = |scale: i32| floor - tall - (name_y + type_h((7 * scale) as f32) + 3);
+    let mut scale = fit_scale(&name, 4, w);
+    while scale > 1 && (stand(scale) as f32) < h as f32 * 0.3 {
+        scale -= 1;
+    }
+    let sprite_h = (stand(scale) as f32 / FEET).min(h as f32 * 0.4).max(10.0);
     let reveal = ease_out(prog(t, since + 1.3, 0.4));
     if reveal > 0.0 {
-        cv.light((cv.w / 2) as f32, (name_y + 7 * scale / 2) as f32, cv.w as f32 * 0.5, cc, 0.3 * reveal);
-        cv.big_center(cv.w / 2, name_y, &name, scale, &|_, y| cc.lerp(pal::INK, 0.4 - y as f32 * 0.02));
+        cv.light(cx as f32, (name_y + 7 * scale / 2) as f32, w as f32 * 0.5, cc, 0.3 * reveal);
+        cv.big_center(cx, name_y, &name, scale, &|_, y| cc.lerp(pal::INK, 0.4 - y as f32 * 0.02));
     }
 
     // Crates: 2nd left, 1st center, 3rd right; 3rd rises first, the champion last.
     let order = [(1usize, 0.55f32, 0.62f32), (0, 0.9, 1.0), (2, 0.25, 0.38)];
-    let bw = (a.width as i32 / 6).clamp(12, 24);
-    let mut names = vec![];
+    let bw = (w / 6).clamp(12, 24);
     for (slot, (rank, delay, height)) in order.into_iter().enumerate() {
         let Some(p) = ranked.get(rank) else { continue };
         let k = ease_out(prog(t, since + delay, 0.45));
-        let h = (tall as f32 * height * k) as i32;
-        let x = cv.w / 2 + (slot as i32 - 1) * (bw + 3) - bw / 2;
-        for yy in 0..h {
-            let plank = (h - yy) % 5 == 0;
-            cv.rect(x, floor - h + yy, bw, 1, if plank { pal::WOOD.mul(0.55) } else { pal::WOOD.mul(0.9 - yy as f32 / (tall * 3) as f32) });
+        let ch = (tall as f32 * height * k) as i32;
+        let x = cx + (slot as i32 - 1) * (bw + 3) - bw / 2;
+        for yy in 0..ch {
+            let plank = (ch - yy) % 5 == 0;
+            cv.rect(x, floor - ch + yy, bw, 1, if plank { pal::WOOD.mul(0.55) } else { pal::WOOD.mul(0.9 - yy as f32 / (tall * 3) as f32) });
         }
-        cv.rect(x, floor - h, bw, 1, hue(p.hue));
-        if k > 0.95 && h >= 9 {
-            cv.big_center(x + bw / 2, floor - h + 3, &(rank + 1).to_string(), 1, &|_, _| pal::INK.mul(0.85));
+        cv.rect(x, floor - ch, bw, 1, hue(p.hue));
+        if k > 0.95 && ch >= 9 {
+            cv.big_center(x + bw / 2, floor - ch + 3, &(rank + 1).to_string(), 1, &|_, _| pal::INK.mul(0.85));
         }
         if k > 0.9 {
-            let drop = (1.0 - ease_out(prog(t, since + delay + 0.45, 0.3))) * cv.h as f32;
-            let top = seat(&mut cv, p.hue as usize % 8, (x + bw / 2) as f32, (floor - h) as f32 - drop, sprite_h, 1.25);
-            if drop < 1.0 {
-                names.push((x, (top as i32) / 2 - 1, p.name.to_uppercase(), p.score));
-            }
+            let drop = (1.0 - ease_out(prog(t, since + delay + 0.45, 0.3))) * h as f32;
+            seat(&mut cv, p.hue as usize % 8, (x + bw / 2) as f32, (floor - ch) as f32 - drop, sprite_h, 1.25);
         }
     }
     // Confetti: player hues and amber, falling forever.
     if l.parts.len() < 160 {
         let seed = (t * 60.0) as u32;
         for i in 0..3 {
-            let h = hash(seed, i);
-            let pick = ranked.get(h as usize % ranked.len()).map(|p| hue(p.hue)).unwrap_or(pal::GOLD);
-            let c = if h % 3 == 0 { pal::GOLD } else { pick };
-            l.parts.push(games::Part { x: (h % cv.w.max(1) as u32) as f32, y: -2.0, vx: ((h >> 8) % 20) as f32 - 10.0, vy: 8.0 + ((h >> 4) % 12) as f32, life: 4.0, c });
+            let hh = hash(seed, i);
+            let pick = ranked.get(hh as usize % ranked.len()).map(|p| hue(p.hue)).unwrap_or(pal::GOLD);
+            let c = if hh % 3 == 0 { pal::GOLD } else { pick };
+            l.parts.push(games::Part { x: (hh % w.max(1) as u32) as f32, y: -2.0, vx: ((hh >> 8) % 20) as f32 - 10.0, vy: 8.0 + ((hh >> 4) % 12) as f32, life: 4.0, c });
         }
     }
     let dt = (t - l.pt).clamp(0.0, 0.1);
     l.pt = t;
     l.draw_parts(&mut cv, dt, 12.0);
-    cv.band(floor + 1, cv.h, pal::BLACK, 0.55);
-    cv.blit(buf, a);
+    cv.band(floor + 1, h, pal::BLACK, 0.6);
 
-    ctext(buf, a, a.y as i32 + 2, &spaced("TONIGHT'S CHAMPION"), pal::GOLD);
-    for (x, row, n, score) in names {
-        let label = format!("{n} {score}");
-        text(buf, a, a.x as i32 + x + (bw - label.len() as i32) / 2, a.y as i32 + row, &label, pal::INK);
+    // The final board, best first, as many as fit.
+    if board {
+        let chips: Vec<(String, Rgb)> = ranked.iter().map(|p| (format!("{} {}", fit_label(&p.name.to_uppercase(), 32, 1), p.score), hue(p.hue))).collect();
+        let mut n = 0;
+        let mut total = -3;
+        for (s, _) in &chips {
+            let cw = label_width(s, 1) + 4 + 3;
+            if total + cw > w - 8 {
+                break;
+            }
+            total += cw;
+            n += 1;
+        }
+        let mut x = cx - total / 2;
+        for (s, c) in &chips[..n] {
+            x += cv.chip(x, board_y, s, pal::STAGE_DEEP, *c) + 3;
+        }
     }
-    let rest: Vec<String> = ranked.iter().skip(3).map(|p| format!("{} {}", p.name.to_uppercase(), p.score)).collect();
-    if !rest.is_empty() {
-        ctext(buf, a, a.bottom() as i32 - 3, &rest.join("   "), pal::DIM);
-    }
-    if host {
-        keys(buf, a, a.bottom() as i32 - 2, &[("ENTER", "back to the lobby"), ("ESC", "leave")]);
-    } else {
-        keys(buf, a, a.bottom() as i32 - 2, &[("ESC", "leave")]);
-        ctext(buf, a, a.bottom() as i32 - 1, "the host will bring everyone back", pal::DIM);
-    }
+    let hints: &[Hint] = if host { &[("ENTER", "back to the lobby"), ("ESC", "leave")] } else { &[("", "the host brings everyone back"), ("ESC", "leave")] };
+    cv.keys(cx, keys_y, w - 8, hints, t);
+    cv.blit(buf, a);
 }
 
-/// One-row header during play: round, game, live score chips.
-pub fn hud(buf: &mut Buffer, a: Rect, s: &Session, kind: Kind) {
-    let row = Rect::new(a.x, a.y, a.width, 1);
-    for x in row.left()..row.right() {
-        let c = &mut buf[(x, row.y)];
-        c.set_char(' ');
-        c.bg = pal::PANEL.color();
+/// The score bar during play: the game and round on the left, the game's own count on the
+/// right, and the leaders' scores between them as far as they fit.
+pub fn hud(buf: &mut Buffer, a: Rect, s: &Session, kind: Kind, status: (String, Rgb)) {
+    let bar = Rect::new(a.x, a.y, a.width, HUD_ROWS.min(a.height));
+    let mut cv = Canvas::for_area(bar, pal::PANEL);
+    cv.rect(0, cv.h - 1, cv.w, 1, pal::BLACK.lerp(pal::PANEL, 0.4));
+    let y = (cv.h - 1 - SMALL) / 2;
+    let right = cv.w - 4 - label_width(&status.0, 1);
+    cv.label(right, y, &status.0, status.1, 1);
+    // Left: the game, then the round, each when it doesn't run into the status.
+    let mut x = 4;
+    let title = games::title(kind);
+    if x + label_width(title, 1) + 8 <= right {
+        x += cv.label(x, y, title, pal::GOLD, 1) + 6;
     }
-    let left = format!("   ROUND {}/{} · {}", s.round + 1, s.rounds, games::title(kind));
-    text(buf, row, row.x as i32, row.y as i32, &left, pal::GOLD);
+    let round = format!("ROUND {}/{}", s.round + 1, s.rounds);
+    if x + label_width(&round, 1) + 8 <= right {
+        x += cv.label(x, y, &round, pal::DIM, 1) + 10;
+    }
     let mut ps: Vec<&Player> = s.players.iter().filter(|p| !p.spectator).collect();
     ps.sort_by_key(|p| std::cmp::Reverse(p.score));
-    let mut x = row.right() as i32 - 2;
-    for p in ps.iter().rev() {
-        let chip = format!(" {} {} ", p.name.to_uppercase().chars().take(8).collect::<String>(), p.score);
-        x -= chip.chars().count() as i32 + 1;
-        if x < row.x as i32 + left.len() as i32 + 2 {
+    for p in ps {
+        let chip = format!("{} {}", fit_label(&p.name.to_uppercase(), 24, 1), p.score);
+        if x + label_width(&chip, 1) + 4 > right - 8 {
             break;
         }
-        text_bg(buf, row, x, row.y as i32, &chip, pal::STAGE_DEEP, hue(p.hue));
+        x += cv.chip(x, y - 1, &chip, pal::STAGE_DEEP, hue(p.hue)) + 3;
     }
+    cv.blit(buf, bar);
 }
 
 /// Broadcast lower third for spectators.
 pub fn lower_third(buf: &mut Buffer, a: Rect, name: &str, c: Rgb, t: f32) {
-    let y = a.bottom() as i32 - 3;
+    let mut cv = Canvas::from_buf(buf, a);
+    let y = cv.h - 4 - CHIP;
     let live = if (t * 1.6).fract() < 0.6 { pal::RED } else { pal::PODIUM_DARK };
-    let label = format!(" CAM · {name} ");
-    text_bg(buf, a, a.x as i32 + 3, y, " ● REC ", pal::INK, live.mul(0.8));
-    text_bg(buf, a, a.x as i32 + 10, y, &label, pal::STAGE_DEEP, c);
-    keycap(buf, a, a.x as i32 + 12 + label.chars().count() as i32, y, "TAB", "switch camera");
+    let mut x = 6;
+    x += cv.chip(x, y, "● REC", pal::INK, live.mul(0.8)) + 2;
+    x += cv.chip(x, y, &format!("CAM · {name}"), pal::STAGE_DEEP, c) + 8;
+    x += cv.chip(x, y, "TAB", pal::STAGE_DEEP, pal::INK.mul(0.78)) + 3;
+    cv.label(x, y + 1, "switch camera", pal::DIM, 1);
+    cv.blit(buf, a);
 }
 
 /// Giant GO! that breaks the grid for half a second.

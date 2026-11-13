@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use serde::{Deserialize, Serialize};
 
 use super::{Fx, Local, View, panel, stage};
-use crate::gfx::{Rgb, big_width, ctext, hash, pal, text};
+use crate::gfx::{LINE, Rgb, SMALL, big_width, fit_label, hash, label_width, pal, pick_label};
 use crate::proto::{Event, Input, Pid};
 
 pub const FLASHES: u8 = 3;
@@ -42,7 +42,7 @@ impl S {
         }
     }
 
-    fn r(&self) -> usize {
+    pub fn r(&self) -> usize {
         self.round.min(FLASHES - 1) as usize
     }
 
@@ -172,27 +172,34 @@ impl S {
                 }
             }
         };
-        // Player tiles anchor to the bottom; the message gets the space above them.
+        // Player tiles anchor to the bottom (over the key hint while waiting); the message gets
+        // the space above them.
+        // Narrow tiles pair up; short ones put the status beside the name.
         let n = self.rt.len().max(1) as i32;
-        let cols = n.min(4);
-        let tw = ((a.width as i32 - 4) / cols - 2).min(22);
-        let th = 5;
+        let mut cols = n.min(4);
+        if n > 2 && (cv.w - 4) / cols - 2 < 30 {
+            cols = 2;
+        }
+        let tw = ((cv.w - 4) / cols - 2).min(44);
         let rows = (n + cols - 1) / cols;
-        let top = a.height as i32 - rows * (th + 1) - 2;
-        let avail = top * 2 - 10;
+        let hint = matches!(self.stage, Stage::Wait { .. }) && my.is_none();
+        let bottom = cv.h - 2 - if hint { SMALL + 2 + 4 } else { 0 };
+        let two = bottom - rows * (3 + 2 * LINE + 2) >= 16;
+        let th = if two { 3 + 2 * LINE } else { 3 + LINE };
+        let top = bottom - rows * (th + 2);
+        let avail = top - 4;
         let mut scale = scale_cap;
-        while scale > 1 && (big_width(&msg, scale) > cv.w - 4 || 7 * scale > avail) {
+        while scale > 1 && (big_width(&msg, scale) > cv.w - 4 || 7 * scale + 2 > avail) {
             scale -= 1;
         }
-        let (my_y, cx) = (6 + (avail - 7 * scale) / 2, cv.w / 2);
+        let (my_y, cx) = (2 + (avail - 7 * scale) / 2, cv.w / 2);
         cv.big_center(cx, my_y, &msg, scale, &*fill);
         let best = self.rt.iter().filter_map(|e| e.1[r]).filter(|&t| t < MISS).min();
-        let mut labels = Vec::new();
         for (i, (p, times)) in self.rt.iter().enumerate() {
             let (col, row) = (i as i32 % cols, i as i32 / cols);
             let row_n = (n - row * cols).min(cols);
-            let x = (a.width as i32 - row_n * (tw + 2)) / 2 + col * (tw + 2) + 1;
-            let y = top + row * (th + 1);
+            let x = (cv.w - row_n * (tw + 2)) / 2 + col * (tw + 2) + 1;
+            let y = top + row * (th + 2);
             let early = times[r] == Some(EARLY);
             let mut stripe = v.hue(*p);
             let mut face = pal::PANEL;
@@ -203,32 +210,34 @@ impl S {
             if v.cam != v.me && *p != v.cam {
                 face = face.mul(0.75);
             }
-            panel(&mut cv, x, y * 2, tw, th * 2, face, stripe);
-            let status = match times[r] {
-                None if flashing => ("· · ·".to_string(), pal::GOLD),
-                None => ("ready".to_string(), pal::DIM),
-                Some(EARLY) => ("TOO EARLY".to_string(), pal::RED),
-                Some(MISS) => ("MISSED".to_string(), pal::DIM),
-                Some(t) if Some(t) == best && matches!(self.stage, Stage::Show { .. }) => (format!("* {t} MS"), pal::GOLD),
-                Some(t) => (format!("{t} MS"), pal::INK),
+            panel(&mut cv, x, y, tw, th, face, stripe);
+            // The longest wording that fits the tile.
+            let (says, sc): (Vec<String>, Rgb) = match times[r] {
+                None if flashing => (vec!["…".into()], pal::GOLD),
+                None => (vec!["READY".into()], pal::DIM),
+                Some(EARLY) => (vec!["TOO EARLY".into(), "EARLY".into(), "✕".into()], pal::RED),
+                Some(MISS) => (vec!["MISSED".into(), "MISS".into(), "-".into()], pal::DIM),
+                Some(t) if Some(t) == best && matches!(self.stage, Stage::Show { .. }) => (vec![format!("★ {t} MS"), format!("★ {t}")], pal::GOLD),
+                Some(t) => (vec![format!("{t} MS"), format!("{t}MS"), t.to_string()], pal::INK),
             };
-            let total: u32 = times[..r].iter().flatten().map(|&t| t as u32).sum();
-            labels.push((x, y, v.name(*p), status, total, early));
-        }
-        cv.blit(buf, a);
-        for (x, y, name, (status, sc), total, early) in labels {
-            let (x, y) = (a.x as i32 + x, a.y as i32 + y);
-            text(buf, a, x + 1, y + 1, &name, if early { pal::DIM } else { pal::INK });
-            text(buf, a, x + 1, y + 2, &status, sc);
-            if r > 0 {
-                text(buf, a, x + 1, y + 3, &format!("total {total}"), pal::DIM);
+            let name_c = if early { pal::DIM } else { pal::INK };
+            if two {
+                cv.label(x + 3, y + 4, &fit_label(&v.name(*p), tw - 6, 1), name_c, 1);
+                cv.label(x + 3, y + 4 + LINE, &pick_label(&says, tw - 6), sc, 1);
+            } else {
+                // The name keeps up to four letters; the status takes what is left.
+                let name = v.name(*p);
+                let keep = label_width(&fit_label(&name, 16, 1), 1).min(label_width(&name, 1));
+                let status = pick_label(&says, tw - 9 - keep);
+                let sw = label_width(&status, 1);
+                cv.label(x + tw - 3 - sw, y + 4, &status, sc, 1);
+                cv.label(x + 3, y + 4, &fit_label(&name, tw - 9 - sw, 1), name_c, 1);
             }
         }
-        let label = format!("FLASH {} OF {}", r + 1, FLASHES);
-        ctext(buf, a, a.y as i32 + 1, &label, pal::DIM);
-        if matches!(self.stage, Stage::Wait { .. }) && my.is_none() {
-            ctext(buf, a, a.bottom() as i32 - 2, "press SPACE the instant the screen flashes", pal::DIM);
+        if hint {
+            cv.keys(cx, cv.h - 2 - SMALL - 2, cv.w - 8, &[("SPACE", "the instant it flashes")], v.t);
         }
+        cv.blit(buf, a);
     }
 }
 
