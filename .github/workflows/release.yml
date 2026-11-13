@@ -41,7 +41,9 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu-22.04 = oldest glibc we support, so the Linux binary runs on 22.04 and newer.
-        os: [ubuntu-22.04, windows-latest, macos-14]
+        # macos-latest: lipo builds both arches, so the runner's own arch doesn't matter and
+        # pinned images (macos-14) get retired out from under us.
+        os: [ubuntu-22.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
