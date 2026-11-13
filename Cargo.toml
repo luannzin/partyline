@@ -2,11 +2,13 @@
 name = "partyline"
 # Bumping this and pushing to main publishes release v<version> (.github/workflows/release.yml),
 # which installed copies then update to.
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 
 [dependencies]
 anyhow = "1"
+# Clipboard without the terminal's help (GNOME's VTE ignores OSC 52).
+arboard = { version = "3", default-features = false }
 fastrand = "2"
 font8x8 = "0.3"
 iroh = "1.4"

@@ -1,7 +1,7 @@
 //! Inside the TV: the test chamber. Contestants seated in the lobby, title cards, countdown,
 //! results board, the champion's crate, and what sits over a game (score bar, camera, GO!).
 //! Every word is pixels in one of the two faces in `gfx`.
-use ratatui::{buffer::Buffer, layout::Rect};
+use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 
 use crate::art::{self, EMPTY_CHAIR};
 use crate::games::{self, Local, stage};
@@ -80,6 +80,9 @@ pub fn lobby(buf: &mut Buffer, a: Rect, s: &Session, me: Pid, host: bool, t: f32
     }
     cv.heading(cx, y, &s.room.to_uppercase(), pal::GOLD, w - 8);
     y += SMALL + 4;
+    // The invite code gets the next whole cell row (filled in after the blit).
+    let code_row = (y - 1) / 2;
+    y = code_row * 2 + 6;
 
     // Nameplates wider than a seat take turns high and low.
     let names: Vec<String> = players.iter().map(|p| p.name.to_uppercase()).collect();
@@ -159,6 +162,19 @@ pub fn lobby(buf: &mut Buffer, a: Rect, s: &Session, me: Pid, host: bool, t: f32
     }
     cv.keys(cx, keys_y, w - 8, &hints, t);
     cv.blit(buf, a);
+    invite(buf, a, code_row as u16, &s.code);
+}
+
+/// The invite code on cell row `row`, as terminal text: 64 characters don't fit in pixel type,
+/// and real text can be selected with the mouse when the clipboard is out of reach.
+fn invite(buf: &mut Buffer, a: Rect, row: u16, code: &str) {
+    const TAG: &str = " INVITE ";
+    let n = code.chars().count() as u16 + 1;
+    let tag = if n + TAG.len() as u16 + 4 <= a.width { TAG } else { " " };
+    let x = a.x + a.width.saturating_sub(n + tag.len() as u16) / 2;
+    let plate = Style::new().bg(pal::PANEL.color());
+    buf.set_string(x, a.y + row, tag, plate.fg(pal::DIM.color()));
+    buf.set_stringn(x + tag.len() as u16, a.y + row, format!("{code} "), a.width as usize, plate.fg(pal::GOLD.color()));
 }
 
 /// Round title card, then a 3-2-1 countdown that breaks the grid.
@@ -501,5 +517,22 @@ pub fn crt(buf: &mut Buffer, a: Rect, p: f32, turning_on: bool) {
                 cell.bg = Rgb::from_color(cell.bg).lerp(pal::INK, k).color();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lobby_shows_whole_invite_code_at_minimum_size() {
+        let code = "0123456789abcdef".repeat(4);
+        let s = Session { room: "r".into(), code: code.clone(), players: vec![], phase: crate::proto::Phase::Lobby, round: 0, rounds: 4 };
+        let a = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(a);
+        lobby(&mut buf, a, &s, 1, true, 10.0, &[]);
+        crate::gfx::crt_glass(&mut buf, a, 10.0);
+        let rows: Vec<String> = (0..a.height).map(|y| (0..a.width).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        assert!(rows.iter().any(|r| r.contains(&format!("INVITE {code}"))));
     }
 }

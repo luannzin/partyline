@@ -148,6 +148,7 @@ pub struct App {
     go_t: f32,
     studio_t: f32,
     toast: Option<(String, f32)>,
+    clip: Option<arboard::Clipboard>,
 }
 
 impl App {
@@ -202,6 +203,7 @@ impl App {
             go_t: -10.0,
             studio_t: 0.0,
             toast: None,
+            clip: None,
         }
     }
 
@@ -735,7 +737,7 @@ impl App {
                 KeyCode::Right if host => self.send(ClientMsg::Rounds(s.rounds + 1)),
                 KeyCode::Enter if host => self.send(ClientMsg::Start),
                 KeyCode::Char('c') | KeyCode::Char('C') => {
-                    osc52(&s.code);
+                    copy(&mut self.clip, &s.code);
                     self.toast = Some(("INVITE CODE COPIED".into(), t));
                     self.sfx.play(Sound::Point);
                 }
@@ -1122,10 +1124,12 @@ impl App {
         if let Some((msg, t0)) = &self.toast {
             let k = t - t0;
             if k < 1.6 {
-                let mut cv = Canvas::from_buf(buf, a);
-                let y = cv.h - 22 + if k < 0.2 { ((0.2 - k) * 20.0) as i32 } else { 0 };
+                // Redraw only the toast's own rows, so terminal text elsewhere (the invite code) stays text.
+                let band = Rect { y: a.bottom() - 11, height: 6, ..a };
+                let mut cv = Canvas::from_buf(buf, band);
+                let y = if k < 0.2 { ((0.2 - k) * 20.0) as i32 } else { 0 };
                 cv.chip_center(cv.w / 2, y, msg, pal::STAGE_DEEP, pal::GOLD);
-                cv.blit(buf, a);
+                cv.blit(buf, band);
             }
         }
         gfx::tint(buf, a, self.fx.flash_c, self.fx.flash);
@@ -1200,7 +1204,19 @@ fn friendly(e: &anyhow::Error) -> (&'static str, &'static str) {
     }
 }
 
-/// Copy to the system clipboard through the terminal (OSC 52; Windows Terminal, kitty, WezTerm, iTerm2).
+/// Copy to the system clipboard, and through the terminal too for SSH sessions (OSC 52;
+/// GNOME's VTE terminals ignore it). The handle stays open: on Linux the copied text lives
+/// only as long as its owner.
+fn copy(clip: &mut Option<arboard::Clipboard>, s: &str) {
+    if clip.is_none() {
+        *clip = arboard::Clipboard::new().ok();
+    }
+    if let Some(c) = clip {
+        let _ = c.set_text(s);
+    }
+    osc52(s);
+}
+
 fn osc52(s: &str) {
     const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
